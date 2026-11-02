@@ -319,6 +319,9 @@ public class AvatarWindowHandler : MonoBehaviour
 		_currentPid = GetCurrentProcessId();
 		animator = GetComponent<Animator>();
 		controller = GetComponent<AvatarAnimatorController>();
+		var tailClearance = GetComponent<MateEngine.CompanionTailClearance>();
+		if (tailClearance == null) tailClearance = gameObject.AddComponent<MateEngine.CompanionTailClearance>();
+		tailClearance.Configure(animator);
 		if (targetCamera == null)
 		{
 			targetCamera = Camera.main;
