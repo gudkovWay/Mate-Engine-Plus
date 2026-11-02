@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="680" viewBox="0 0 1000 680">
+  <rect width="1000" height="680" fill="#ffffff"/>
+  <g font-family="DejaVu Sans, sans-serif" fill="#151515">
+    <text x="40" y="55" font-size="22">CITY SCIENCE DESK · News channel · Today, 12:40</text>
+    <path d="M40 80H960" stroke="#b4b4b4"/>
+    <text x="40" y="140" font-size="30" font-weight="bold">A new public observatory opens this weekend</text>
+    <g font-size="23">
+      <text x="40" y="205">The university has finished restoring the old telescope.</text>
+      <text x="40" y="245">Visitors can join an evening tour and attend a short</text>
+      <text x="40" y="285">introduction to astronomy. The programme includes</text>
+      <text x="40" y="325">accessible sessions for school groups.</text>
+      <text x="40" y="390">Registration opens on Thursday. There is no admission fee.</text>
+      <text x="40" y="465">Views 1,203 · Comments 28 · Share</text>
+    </g>
+    <path d="M40 505H960" stroke="#b4b4b4"/>
+    <text x="40" y="560" font-size="23">Next post: The city library extends its opening hours.</text>
+    <text x="40" y="630" font-size="16" fill="#666666">Public synthetic input fixture. No personal messages or screen capture.</text>
+  </g>
+</svg>
