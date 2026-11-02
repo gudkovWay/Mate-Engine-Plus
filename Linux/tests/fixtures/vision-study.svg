@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="680" viewBox="0 0 1000 680">
+  <rect width="1000" height="680" fill="#ffffff"/>
+  <g font-family="DejaVu Sans, sans-serif" fill="#151515">
+    <text x="40" y="55" font-size="22">Python documentation / asyncio / Task cancellation</text>
+    <path d="M40 80H960" stroke="#b4b4b4"/>
+    <text x="40" y="140" font-size="30" font-weight="bold">Structured concurrency with TaskGroup</text>
+    <g font-size="23">
+      <text x="40" y="200">TaskGroup waits for every child. If a child fails, the remaining</text>
+      <text x="40" y="240">tasks are cancelled before the context exits.</text>
+    </g>
+    <rect x="40" y="275" width="920" height="195" rx="4" fill="#f0f2f4"/>
+    <g font-family="DejaVu Sans Mono, monospace" font-size="22">
+      <text x="60" y="315">async def fetch_all(urls):</text>
+      <text x="60" y="355">    async with asyncio.TaskGroup() as group:</text>
+      <text x="60" y="395">        tasks = [group.create_task(fetch(url)) for url in urls]</text>
+      <text x="60" y="435">    return [task.result() for task in tasks]</text>
+    </g>
+    <text x="40" y="525" font-size="23">Exercise: why can swallowing CancelledError break TaskGroup?</text>
+    <text x="40" y="565" font-size="23">Use try/finally to release resources when cancellation arrives.</text>
+    <text x="40" y="630" font-size="16" fill="#666666">Public synthetic input fixture. No personal code or screen capture.</text>
+  </g>
+</svg>

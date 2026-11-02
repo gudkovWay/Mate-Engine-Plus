@@ -1,8 +1,7 @@
 // Inserts calls into MateEngine.ShojiBridge into the original
 // rebuilt Assembly-CSharp.dll of the isolated MateEngine X3.4 Linux port.
-// Only call sites are added;
-// every hook falls through to the unchanged original code when the bridge
-// does not handle it.
+// Hooks fall through when the bridge does not handle a call.
+// The native radial menu also gains capacity for its companion entry.
 //
 //   mono PatchAssembly.exe <original Assembly-CSharp.dll> <MateEngine.ShojiBridge.dll> <output Assembly-CSharp.dll>
 using System;
@@ -66,8 +65,8 @@ static class PatchAssembly
                     Instruction.Create(OpCodes.Brtrue, first),
                     Instruction.Create(OpCodes.Ret),
                 });
-                PatchPointerReads(Type("AvatarMouseTracking"), "DoHead", "DoSpine", "DoEye");
-                PatchPointerReads(Type("AvatarBigScreenTouchHandler"), "HandleSpringBoneTouch");
+                PatchPointerReads(Type("AvatarMouseTracking"), 1, "DoHead", "DoSpine", "DoEye");
+                PatchPointerReads(Type("AvatarBigScreenTouchHandler"), 1, "HandleSpringBoneTouch");
                 var touch = Method(Type("AvatarBigScreenTouchHandler"), "Update", 0);
                 var touchButton = Single(touch.Body.Instructions, i => {
                     var called = i.Operand as MethodReference;
@@ -77,8 +76,25 @@ static class PatchAssembly
                 applied.Add("AvatarBigScreenTouchHandler::Update workspace visibility");
                 PatchSeating(Type("AvatarWindowHandler"));
                 ReturnFromBridge(Method(Type("MonitorHelper"), "GetTaskbarRectForWindow", 0), Bridge("TryGetTaskbarRect"));
+                var radial = Method(Type("Xamin.CircleSelector"), "BuildButtons", 0);
+                var capacity = Single(radial.Body.Instructions, i =>
+                    (i.OpCode == OpCodes.Ldc_I4_S || i.OpCode == OpCodes.Ldc_I4) &&
+                    Convert.ToInt32(i.Operand) == 11 &&
+                    i.Previous != null && i.Previous.OpCode == OpCodes.Ldfld &&
+                    ((FieldReference)i.Previous.Operand).Name == "buttonCount", "native radial capacity");
+                ExpandShortBranches(radial.Body);
+                capacity.OpCode = OpCodes.Ldc_I4;
+                capacity.Operand = 12;
+                applied.Add("Xamin.CircleSelector::BuildButtons companion entry capacity");
+                PatchPointerReads(Type("Xamin.CircleSelector"), 2, "Update");
+                Prologue(Method(Type("Xamin.CircleSelector"), "CheckForInput", 0), first => new[] {
+                    Instruction.Create(OpCodes.Ldarg_0),
+                    Instruction.Create(OpCodes.Call, Bridge("AllowRadialInput")),
+                    Instruction.Create(OpCodes.Brtrue, first),
+                    Instruction.Create(OpCodes.Ret),
+                });
 
-                int calls = module.Types.SelectMany(t => t.Methods).Where(m => m.HasBody)
+                int calls = AllTypes(module.Types).SelectMany(t => t.Methods).Where(m => m.HasBody)
                     .Sum(m => m.Body.Instructions.Count(i => {
                         var method = i.Operand as MethodReference;
                         return method != null && method.DeclaringType.FullName == BridgeType;
@@ -296,18 +312,23 @@ static class PatchAssembly
         }
     }
 
-    static void PatchPointerReads(TypeDefinition type, params string[] names)
+    static void PatchPointerReads(TypeDefinition type, int expectedReads, params string[] names)
     {
         foreach (string name in names)
         {
             var method = Method(type, name, 0);
-            var read = Single(method.Body.Instructions, i => {
+            var reads = method.Body.Instructions.Where(i => {
                 var target = i.Operand as MethodReference;
                 return target != null && target.DeclaringType.FullName == "UnityEngine.Input" &&
                     target.Name == "get_mousePosition";
-            }, type.Name + "::" + name + " Input.mousePosition");
-            read.OpCode = OpCodes.Call;
-            read.Operand = Bridge("GetUnityMousePosition");
+            }).ToArray();
+            if (reads.Length != expectedReads)
+                throw new InvalidOperationException(type.Name + "::" + name + " pointer read count changed: " + reads.Length);
+            foreach (var read in reads)
+            {
+                read.OpCode = OpCodes.Call;
+                read.Operand = Bridge("GetUnityMousePosition");
+            }
             applied.Add(type.Name + "::" + name + " compositor pointer");
         }
     }
@@ -322,10 +343,61 @@ static class PatchAssembly
         }, "Input.GetMouseButtonUp call");
         call.Operand = Bridge("GetMouseButtonUp");
         applied.Add("AvatarAnimatorController::Update");
+        var animator = Field(type, "animator");
+        if (!animator.IsPublic || animator.FieldType.FullName != "UnityEngine.Animator")
+            throw new InvalidOperationException(type.Name + "::animator contract changed");
+        foreach (var name in new[] { "Update", "CheckForSound" })
+            Prologue(Method(type, name, 0), first => new[] {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, animator),
+                Instruction.Create(OpCodes.Call, Bridge("CompanionMotionOwns")),
+                Instruction.Create(OpCodes.Brfalse, first),
+                Instruction.Create(OpCodes.Ret),
+            });
+        foreach (var name in new[] { "SmoothIdleTransition", "SmoothDanceTransition" })
+        {
+            var iterator = Single(type.NestedTypes, nested => nested.Name.StartsWith("<" + name + ">", StringComparison.Ordinal),
+                type.Name + "::" + name + " generated iterator");
+            var owner = Single(iterator.Fields, field => field.FieldType.FullName == type.FullName,
+                iterator.Name + " controller capture");
+            var moveNext = Method(iterator, "MoveNext", 0);
+            if (moveNext.ReturnType.FullName != "System.Boolean")
+                throw new InvalidOperationException(iterator.Name + "::MoveNext must return bool");
+            var currentFields = iterator.Methods.Where(method => method.HasBody &&
+                    method.Name.EndsWith("get_Current", StringComparison.Ordinal) && method.ReturnType.FullName == "System.Object")
+                .SelectMany(method => method.Body.Instructions)
+                .Where(instruction => instruction.OpCode == OpCodes.Ldfld)
+                .Select(instruction => instruction.Operand as FieldReference)
+                .Where(field => field != null && field.DeclaringType.FullName == iterator.FullName &&
+                    field.FieldType.FullName == "System.Object")
+                .Select(field => field.Name).Distinct().ToArray();
+            var current = Single(iterator.Fields, field => currentFields.Contains(field.Name),
+                iterator.Name + " IEnumerator.Current backing field");
+            // Yield without advancing the compiler state, elapsed time or controller writes.
+            Prologue(moveNext, first => new[] {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldfld, owner),
+                Instruction.Create(OpCodes.Ldfld, animator),
+                Instruction.Create(OpCodes.Call, Bridge("CompanionMotionOwns")),
+                Instruction.Create(OpCodes.Brfalse, first),
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldnull),
+                Instruction.Create(OpCodes.Stfld, current),
+                Instruction.Create(OpCodes.Ldc_I4_1),
+                Instruction.Create(OpCodes.Ret),
+            });
+        }
     }
 
     static void PatchSeating(TypeDefinition type)
     {
+        Prologue(Method(type, "SetOtherQuadsActive", 1), first => new[] {
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldarg_1),
+            Instruction.Create(OpCodes.Call, Bridge("TrySetOtherQuadsActive")),
+            Instruction.Create(OpCodes.Brfalse, first),
+            Instruction.Create(OpCodes.Ret),
+        });
         MethodDefinition snap = Method(type, "TrySnap", 0);
         var snapProbes = snap.Body.Instructions.Where(i => {
             var called = i.Operand as MethodReference;
@@ -514,6 +586,15 @@ static class PatchAssembly
         var target = instruction.OpCode == OpCodes.Call || instruction.OpCode == OpCodes.Callvirt
             ? instruction.Operand as MethodReference : null;
         return target != null && target.Name == name;
+    }
+
+    static IEnumerable<TypeDefinition> AllTypes(IEnumerable<TypeDefinition> types)
+    {
+        foreach (var type in types)
+        {
+            yield return type;
+            foreach (var nested in AllTypes(type.NestedTypes)) yield return nested;
+        }
     }
 
     static MethodReference Bridge(string name)

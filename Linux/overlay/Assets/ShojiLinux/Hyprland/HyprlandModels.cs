@@ -28,7 +28,27 @@ namespace APIs.Hyprland
         public string make;
         public int width;
         public int height;
-        public Vector2Int size => new Vector2Int(width, height);
+        public float scale = 1f;
+        public int transform;
+        public bool focused;
+        public bool dpmsStatus;
+        public int[] reserved;
+        public Vector2Int size => new Vector2Int(
+            Mathf.RoundToInt((transform % 2 == 0 ? width : height) / Math.Max(scale, 0.1f)),
+            Mathf.RoundToInt((transform % 2 == 0 ? height : width) / Math.Max(scale, 0.1f)));
+        public RectInt workArea
+        {
+            get
+            {
+                var logical = size;
+                var left = reserved != null && reserved.Length == 4 ? reserved[0] : 0;
+                var top = reserved != null && reserved.Length == 4 ? reserved[1] : 0;
+                var right = reserved != null && reserved.Length == 4 ? reserved[2] : 0;
+                var bottom = reserved != null && reserved.Length == 4 ? reserved[3] : 0;
+                return new RectInt(x + left, y + top, Math.Max(1, logical.x - left - right),
+                    Math.Max(1, logical.y - top - bottom));
+            }
+        }
         public int x;
         public int y;
         public Vector2Int position => new Vector2Int(x, y);
@@ -41,6 +61,11 @@ namespace APIs.Hyprland
     {
         public int id;
         public string name;
+        public string type;
+        public bool IsSpecial => id < 0 || type == "special" ||
+            name != null && name.StartsWith("special:", StringComparison.Ordinal);
+        public bool Matches(HyprlandWorkspace other) => other != null && IsSpecial == other.IsSpecial &&
+            (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(other.name) ? name == other.name : id == other.id);
     }
 
     [Serializable]
@@ -59,6 +84,7 @@ namespace APIs.Hyprland
         public int fullscreen;
         public string title;
         public bool hidden;
+        public bool mapped;
         public bool pinned;
         public bool xwayland;
         public HyprlandWorkspace workspace;

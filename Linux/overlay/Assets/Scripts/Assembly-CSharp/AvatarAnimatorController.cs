@@ -123,7 +123,7 @@ public class AvatarAnimatorController : MonoBehaviour
 
 	private void CheckForSound()
 	{
-		if (MenuActions.IsMovementBlocked() || !enableDancing)
+		if (MenuActions.IsMovementBlocked() || !enableDancing || MateEngine.Vision.VisionAudioPolicy.Owns(animator))
 		{
 			if (isDancing)
 			{
@@ -156,6 +156,11 @@ public class AvatarAnimatorController : MonoBehaviour
 		}
 	}
 
+	public void SuppressAutomaticDanceForVision()
+	{
+		if (isDancing) SetDancing(false);
+	}
+
 	private IEnumerator CheckPlayingAudio()
 	{
 		// Yield before querying so the owner can store and cancel this coroutine.
@@ -181,7 +186,7 @@ public class AvatarAnimatorController : MonoBehaviour
 				}
 			}
 		}
-		if (!MenuActions.IsMovementBlocked() && enableDancing && !isDragging)
+		if (!MenuActions.IsMovementBlocked() && enableDancing && !isDragging && !MateEngine.Vision.VisionAudioPolicy.Owns(animator))
 		{
 			if (playing && !isDancing) StartDancing();
 			else if (!playing && isDancing) SetDancing(false);
@@ -205,25 +210,36 @@ public class AvatarAnimatorController : MonoBehaviour
 			}
 			return;
 		}
-		if (Input.GetMouseButtonDown(0))
+		var native = WindowManager.Instance?.CompanionManager;
+		if (native != null)
 		{
-			SetDragging(value: true);
-			mouseHeld = true;
-			dragLockTimer = 0.3f;
-			SetDancing(value: false);
+			// A native gesture has one lifecycle, even when Xwayland drops a button-up event.
+			if (isDragging != native.IsDragging) SetDragging(native.IsDragging);
+			mouseHeld = native.IsDragging; dragLockTimer = 0;
+			if (isDragging && isDancing) SetDancing(false);
 		}
-		if (Input.GetMouseButtonUp(0))
+		else
 		{
-			mouseHeld = false;
-		}
-		if (dragLockTimer > 0f)
-		{
-			dragLockTimer -= Time.deltaTime;
-			animator.SetBool(isDraggingParam, value: true);
-		}
-		else if (!mouseHeld && isDragging)
-		{
-			SetDragging(value: false);
+			if (Input.GetMouseButtonDown(0))
+			{
+				SetDragging(value: true);
+				mouseHeld = true;
+				dragLockTimer = 0.3f;
+				SetDancing(value: false);
+			}
+			if (Input.GetMouseButtonUp(0))
+			{
+				mouseHeld = false;
+			}
+			if (dragLockTimer > 0f)
+			{
+				dragLockTimer -= Time.deltaTime;
+				animator.SetBool(isDraggingParam, value: true);
+			}
+			else if (!mouseHeld && isDragging)
+			{
+				SetDragging(value: false);
+			}
 		}
 		idleTimer += Time.deltaTime;
 		if (idleTimer > IDLE_SWITCH_TIME)

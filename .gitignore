@@ -169,7 +169,7 @@ _build
 
 # Private inputs and generated outputs for the source-only X3.4 migration
 /Linux/project/
-/Linux/steam-source/
+/Linux/steam-source
 /Linux/recovered/
 /Linux/inspection/
 /Linux/baseline/

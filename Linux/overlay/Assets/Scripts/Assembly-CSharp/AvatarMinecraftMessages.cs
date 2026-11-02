@@ -220,6 +220,7 @@ public class AvatarMinecraftMessages : MonoBehaviour
 
 	private void OnEnable()
 	{
+		if (APIs.Hyprland.CompanionPresencePolicy.OwnedAuditionWorkspace != null) return;
 		try
 		{
 			client = new UdpClient(port);

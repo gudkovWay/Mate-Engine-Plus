@@ -3,13 +3,14 @@
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
 import shutil
 
 ROOT = Path(__file__).resolve().parent.parent
 PROJECT = ROOT / "project"
-UPSTREAM = ROOT / "linux-upstream"
-POST = ROOT / "tools/postprocessing-3.5.1/package"
+UPSTREAM = (ROOT / "linux-upstream").resolve()
+POST = (ROOT / "tools/postprocessing-3.5.1/package").resolve()
 INCLUDE = re.compile(r'(^\s*#include(?:_with_pragmas)?\s+")([^"]+)(")', re.M)
 SHADER = re.compile(r'\bShader\s+"([^"]+)"')
 POST_PREFIX = "Packages/com.unity.postprocessing/"
@@ -18,9 +19,9 @@ ANALOGUES = {"Hidden/LilBugShader/Refraction": "Hidden/lilToonRefraction"}
 
 
 def destination(source):
-    if source.is_relative_to(UPSTREAM):
-        return source.relative_to(UPSTREAM).as_posix()
-    return POST_DEST + source.relative_to(POST).as_posix()
+    if source.is_relative_to(POST):
+        return POST_DEST + source.relative_to(POST).as_posix()
+    return source.relative_to(UPSTREAM).as_posix()
 
 
 def rewrite(source):
@@ -62,7 +63,7 @@ for name in ("Hidden/lilToonTwoPassTransparent", "Hidden/lilToonTwoPassTranspare
     target = PROJECT / "Assets/Shader" / (name.replace("/", "_") + ".shader")
     target.write_text(rewrite(source), encoding="utf-8")
     restored.append({"shader": name, "target": str(target.relative_to(PROJECT)),
-                     "source": str(source.relative_to(ROOT)),
+                     "source": os.path.relpath(source, ROOT),
                      "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                      "analogue": None})
 
@@ -85,7 +86,7 @@ for path in sorted((PROJECT / "Assets").rglob("*.shader")):
         body = body.replace(f'Shader "{source_name}"', f'Shader "{name}"', 1)
     path.write_text(body, encoding="utf-8")
     restored.append({"shader": name, "target": str(path.relative_to(PROJECT)),
-                     "source": str(source.relative_to(ROOT)),
+                     "source": os.path.relpath(source, ROOT),
                      "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                      "analogue": source_name if source_name != name else None})
 

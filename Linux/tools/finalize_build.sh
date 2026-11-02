@@ -12,7 +12,8 @@ cp -p "$MANAGED/Assembly-CSharp.dll" "$PATCH_OUT/Assembly-CSharp.original.dll"
 refs=()
 for name in mscorlib netstandard System System.Core UnityEngine.CoreModule UnityEngine.SharedInternalsModule \
     UnityEngine.UIModule UnityEngine.UI UnityEngine.InputLegacyModule UnityEngine.TextRenderingModule \
-    UnityEngine.PhysicsModule UnityEngine.IMGUIModule UnityEngine.AnimationModule UnityEngine.AudioModule UnityEngine.JSONSerializeModule; do
+    UnityEngine.PhysicsModule UnityEngine.IMGUIModule UnityEngine.AnimationModule UnityEngine.AudioModule \
+    UnityEngine.JSONSerializeModule com.rlabrecque.steamworks.net; do
     refs+=("-r:$MANAGED/$name.dll")
 done
 refs+=("-r:$PATCH_OUT/Assembly-CSharp.original.dll")
@@ -24,7 +25,7 @@ mono "$PATCH_OUT/PatchAssembly.exe" "$PATCH_OUT/Assembly-CSharp.original.dll" \
 expected=$(sed -n 's/^bridge call sites: //p' "$PATCH_OUT/patch.log")
 MONO_PATH="$MANAGED:$PATCH_OUT" monodis "$PATCH_OUT/Assembly-CSharp.dll" > "$PATCH_OUT/Assembly-CSharp.il"
 calls=$(rg -c 'MateEngine.Shoji.ShojiBridge::' "$PATCH_OUT/Assembly-CSharp.il")
-[ "$expected" = 47 ] && [ "$calls" -eq "$expected" ] || { echo "Unexpected hooks: $calls/$expected" >&2; exit 1; }
+[ "$expected" = 55 ] && [ "$calls" -eq "$expected" ] || { echo "Unexpected hooks: $calls/$expected" >&2; exit 1; }
 # Keep Windows-only LlamaLib binaries in the build archive, not the Linux payload.
 LLM_ROOT="$PLAYER/MateEngineX_Data/StreamingAssets/undreamai-v1.2.5-llamacpp"
 mkdir -p "$PATCH_OUT/windows-backends"
@@ -32,6 +33,10 @@ for backend in "$LLM_ROOT"/windows-*; do
     [[ -e "$backend" ]] || continue
     mv "$backend" "$PATCH_OUT/windows-backends/"
 done
+bash "$PORT_ROOT/tools/build_vision_capture.sh" "$PATCH_OUT/vision-capture"
+mkdir "$PLAYER/vision"
+cp -p "$PORT_ROOT/tools/mascot_vision.py" "$PORT_ROOT/tools/mascot_vision_launch.py" \
+    "$PORT_ROOT/tools/vision_model.mjs" "$PATCH_OUT/vision-capture/vision-toplevels" "$PLAYER/vision/"
 cp -p "$PATCH_OUT/Assembly-CSharp.dll" "$PATCH_OUT/MateEngine.ShojiBridge.dll" "$MANAGED/"
 cp -p "$PORT_ROOT/tools/launch-3.4.sh" "$PLAYER/launch.sh"
 chmod +x "$PLAYER/launch.sh"

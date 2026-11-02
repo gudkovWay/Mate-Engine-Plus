@@ -29,46 +29,40 @@ namespace APIs.Hyprland
     {
         public void Dispose()
         {
-            _StreamReader?.Dispose();
+            _Disposed = true;
             _Socket?.Dispose();
         }
 
         const string _SocketName = ".socket2.sock";
-        StreamReader _StreamReader;
         Socket _Socket;
+        bool _Disposed;
 
         public bool SocketExists() => SockerExistsImpl(_SocketName);
 
         public async void Start(IList<string> eventFilter)
         {
-            var eventSocketPath = GetSocketPath(_SocketName);
-
-            _Socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            var endpoint = new UnixDomainSocketEndPoint(eventSocketPath);
-
-            await _Socket.ConnectAsync(endpoint);
-
-            var stream = new NetworkStream(_Socket, ownsSocket: true);
-            _StreamReader = new StreamReader(stream);
-
-            while (true)
+            try
             {
-                // events are terminated by \n
-                var output = await _StreamReader.ReadLineAsync();
-                if (!string.IsNullOrWhiteSpace(output))
+                var eventSocketPath = GetSocketPath(_SocketName);
+                _Socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                await _Socket.ConnectAsync(new UnixDomainSocketEndPoint(eventSocketPath));
+                using var stream = new NetworkStream(_Socket, ownsSocket: true);
+                using var reader = new StreamReader(stream);
+                while (!_Disposed)
                 {
-                    // format: evetName>>parameter1,paramater2,parameter3
-                    var parts = output.Split(">>", StringSplitOptions.RemoveEmptyEntries);
-
-                    if (eventFilter.Any(a => parts[0] == a))
-                        continue;
-
-                    var parameters = new string[0];
-                    if (parts.Length > 1)
-                        parameters = parts[1].Split(",", StringSplitOptions.RemoveEmptyEntries);
-
-                    HyprlandEvent?.Invoke(this, new HyprlandEventArgs(parts[0], parameters));
+                    var output = await reader.ReadLineAsync();
+                    if (output == null) break;
+                    var separator = output.IndexOf(">>", StringComparison.Ordinal);
+                    if (separator <= 0) continue;
+                    var name = output.Substring(0, separator);
+                    if (eventFilter.Contains(name)) continue;
+                    var parameters = output.Substring(separator + 2).Split(',');
+                    HyprlandEvent?.Invoke(this, new HyprlandEventArgs(name, parameters));
                 }
+            }
+            catch (Exception error)
+            {
+                if (!_Disposed) Console.Error.WriteLine("Hyprland event stream closed: " + error.Message);
             }
         }
 

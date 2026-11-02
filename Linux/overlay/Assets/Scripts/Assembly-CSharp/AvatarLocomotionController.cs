@@ -120,6 +120,7 @@ public sealed class AvatarLocomotionController : MonoBehaviour
 	private IntPtr _hwnd = IntPtr.Zero;
 
 	private bool _walking;
+	public bool IsWalking => _walking;
 
 	private int _dir;
 
@@ -219,6 +220,12 @@ public sealed class AvatarLocomotionController : MonoBehaviour
 		ResolveBoundsRenderersSmart(immediate: false);
 		if (Animator == null)
 		{
+			return;
+		}
+		if (WindowManager.Instance?.CompanionManager != null &&
+			(WindowManager.Instance.CompanionManager.CompanionMotion || WindowManager.Instance.CompanionManager.SupportTracking))
+		{
+			if (_walking) StopWalking();
 			return;
 		}
 		if (_hwnd == IntPtr.Zero)

@@ -104,6 +104,8 @@ public static class Shoji34Build
         RestoreDynamicFont();
         RestoreHideAnimationOrientation();
         PrepareSceneInputAndTransparency();
+        CompanionAnimationBuild.Prepare();
+        CompanionVisionBuild.Prepare();
         BuildContent();
         PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.StandaloneLinux64, false);
         PlayerSettings.SetGraphicsAPIs(BuildTarget.StandaloneLinux64, new[] { GraphicsDeviceType.Vulkan, GraphicsDeviceType.OpenGLCore });

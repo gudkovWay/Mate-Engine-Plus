@@ -13,6 +13,9 @@ public class FPSLimiter : MonoBehaviour
 	public TextMeshProUGUI fpsLabel;
 
 	private int previousFPS;
+	public int EffectiveFPS { get; private set; }
+	public string RuntimePolicy { get; private set; } = "requested";
+	private float lastActivity;
 
 	private void Start()
 	{
@@ -34,17 +37,33 @@ public class FPSLimiter : MonoBehaviour
 		{
 			ApplyFPSLimit();
 		}
+		ApplyEffectiveLimit();
 	}
 
 	public void ApplyFPSLimit()
 	{
-		Application.targetFrameRate = targetFPS;
 		QualitySettings.vSyncCount = 0;
+		ApplyEffectiveLimit();
 		previousFPS = targetFPS;
 		PlayerPrefs.SetInt("FPSLimit", targetFPS);
 		PlayerPrefs.Save();
 		UpdateFPSLabel(targetFPS);
 		Debug.Log("FPS set to: " + targetFPS);
+	}
+
+	private void ApplyEffectiveLimit()
+	{
+		var manager = WindowManager.Instance?.CompanionManager;
+		bool active = manager != null && manager.InteractionActive;
+		if (active) lastActivity = Time.unscaledTime;
+		bool hidden = manager != null && manager.ConfirmedHidden;
+		int next = APIs.Hyprland.CompanionPresencePolicy.EffectiveFrames(targetFPS, manager != null,
+			active, hidden, Time.unscaledTime, lastActivity);
+		RuntimePolicy = manager == null ? "requested" : active || Time.unscaledTime - lastActivity < 2f ? "active" :
+			hidden ? "hidden" : manager.ObservationFresh ? "passive" : "visibility-unknown";
+		if (next == EffectiveFPS) return;
+		EffectiveFPS = next;
+		Application.targetFrameRate = next;
 	}
 
 	public void SetFPSLimit(float fps)

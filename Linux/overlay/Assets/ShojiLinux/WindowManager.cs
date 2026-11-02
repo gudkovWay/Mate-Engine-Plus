@@ -51,6 +51,10 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
     private Vector2Int _initialMousePos;
     private Vector2Int _initialWindowPos;
     private volatile bool _isDragging;
+    private Transform _manualAnchor;
+    private Camera _manualCamera;
+    private Vector2 _manualInitialAnchor, _manualDropAnchor;
+    private float _manualSettleUntil;
 
     public bool IsDragging => _isDragging;
 
@@ -161,7 +165,7 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
                 _currentSessionType = SessionTypes.Unknown;
             }
 
-            if (_currentSessionType == SessionTypes.Wayland)
+            if (_currentSessionType == SessionTypes.Wayland && _windowManagerImplementation == null)
             {
                 // The bridge connects asynchronously; check its actual capabilities.
                 ResolveShojiCapabilities();
@@ -183,9 +187,61 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
     IWindowManagerImplementation _windowManagerImplementation = null;
 
     private Vector2 _lastPos;
+    private volatile bool _passiveInput;
+    private volatile Rect[] _companionInputRegions = Array.Empty<Rect>();
+    private Rect[] _convertedRegionSource;
+    private XRectangle[] _convertedRegions = Array.Empty<XRectangle>();
+    private int _regionWidth, _regionHeight;
+    public APIs.Hyprland.HyprlandManager CompanionManager =>
+        _windowManagerImplementation as APIs.Hyprland.HyprlandManager;
+
+    public void SetPassiveInput(bool passive)
+    {
+        if (_passiveInput == passive || _closing) return;
+        _passiveInput = passive;
+        if (CompanionManager != null) CompanionManager.PassiveInput = passive;
+        WakeInputMask();
+    }
+
+    // Published arrays are immutable; the X11 worker converts only changed geometry.
+    public void SetCompanionInputRegions(Rect[] regions)
+    {
+        if (_closing) return;
+        _companionInputRegions = regions ?? Array.Empty<Rect>();
+        var manager = CompanionManager;
+        if (manager != null)
+        {
+            var normalized = new Rect[_companionInputRegions.Length];
+            for (int i = 0; i < normalized.Length; i++)
+            {
+                var rect = _companionInputRegions[i];
+                normalized[i] = new Rect(rect.x / Mathf.Max(1, Screen.width), rect.y / Mathf.Max(1, Screen.height),
+                    rect.width / Mathf.Max(1, Screen.width), rect.height / Mathf.Max(1, Screen.height));
+            }
+            manager.SetCompanionInputRegions(normalized);
+        }
+        WakeInputMask();
+    }
+
+    private void WakeInputMask()
+    {
+        if (_display == IntPtr.Zero || _unityWindow == IntPtr.Zero) return;
+        var wake = new XClientMessageEvent
+        {
+            type = ClientMessage, window = _unityWindow,
+            message_type = _wakeupAtom, format = 32
+        };
+        XSendEvent(_display, _unityWindow, false, 0, ref wake);
+        XFlush(_display);
+    }
+
 
     private void Update()
     {
+        if (_windowManagerImplementation is APIs.Hyprland.HyprlandManager hyprland)
+            hyprland.SampleInteraction();
+        if (_isDragging && (!GetMouseButton(KeyCode.Mouse0) || Input.GetKeyDown(KeyCode.Escape)))
+            OnPointerUp(null);
         if (_mouseOver)
             UpdateCursorState();
         if (_isDragging)
@@ -193,10 +249,28 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
             var currentMousePos = GetMousePosition();
             var delta = currentMousePos - _initialMousePos;
             var newPos = _initialWindowPos + delta;
+            if (TryManualAnchor(out var anchor))
+                newPos += Vector2Int.RoundToInt(_manualInitialAnchor - anchor);
             if (newPos == _lastPos) return;
             SetWindowPosition(newPos);
             _lastPos = newPos;
         }
+        else if (Time.unscaledTime < _manualSettleUntil && CompanionManager != null)
+        {
+            if (CompanionManager.SupportTracking || CompanionManager.CompanionMotion)
+                _manualSettleUntil = 0;
+            else if (TryManualAnchor(out var anchor))
+            {
+                var target = Vector2Int.RoundToInt(_manualDropAnchor - anchor);
+                if (GetWindowPosition() != target) CompanionManager.SetManualPosition(target);
+            }
+        }
+    }
+
+    private void LateUpdate()
+    {
+        // EventSystem has selected the actual clicked field by this point.
+        CompanionManager?.SampleKeyboardIntent();
     }
 
     private void Awake()
@@ -253,10 +327,25 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
     private void OnApplicationQuit() => Dispose();
     private void OnDestroy() => Dispose();
 
+    private void OnApplicationFocus(bool focused)
+    {
+        if (!focused && _isDragging) OnPointerUp(null);
+    }
+
     public void OnPointerDown(PointerEventData eventData)
     {
+        if (eventData == null || eventData.button != PointerEventData.InputButton.Left) return;
         _initialMousePos = GetMousePosition();
         _initialWindowPos = GetWindowPosition();
+        _manualSettleUntil = 0;
+        _manualAnchor = null;
+        if (CompanionManager != null)
+        {
+            var avatar = UnityEngine.Object.FindFirstObjectByType<AvatarAnimatorReceiver>()?.avatarAnimator;
+            _manualCamera = Camera.main;
+            if (avatar != null && avatar.isHuman) _manualAnchor = avatar.GetBoneTransform(HumanBodyBones.Hips);
+            TryManualAnchor(out _manualInitialAnchor);
+        }
         _isDragging = true;
         if (_windowManagerImplementation != null)
             _windowManagerImplementation.IsDragging = true;
@@ -265,10 +354,27 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
 
     public void OnPointerUp(PointerEventData eventData)
     {
+        if (CompanionManager != null && TryManualAnchor(out var anchor))
+        {
+            _manualDropAnchor = (Vector2)GetWindowPosition() + anchor;
+            _manualSettleUntil = Time.unscaledTime + 1f;
+        }
         _isDragging = false;
         if (_windowManagerImplementation != null)
             _windowManagerImplementation.IsDragging = false;
         UpdateCursorState();
+    }
+
+    private bool TryManualAnchor(out Vector2 local)
+    {
+        local = Vector2.zero;
+        var client = CompanionManager?.CompanionWindow;
+        if (_manualAnchor == null || _manualCamera == null || client == null || Screen.width <= 0 || Screen.height <= 0) return false;
+        var point = _manualCamera.WorldToScreenPoint(_manualAnchor.position);
+        if (point.z <= .01f) return false;
+        local = new Vector2(point.x * client.sizeVector.x / Screen.width,
+            (Screen.height - point.y) * client.sizeVector.y / Screen.height);
+        return true;
     }
 
     public void OnPointerEnter(PointerEventData eventData)
@@ -949,9 +1055,9 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
         return result;
     }
 
-    public bool GetMouseButton(KeyCode button) // 0=left, 1=right, 2=middle
+    public int GetMouseButtons()
     {
-        if (_display == IntPtr.Zero) return false;
+        if (_display == IntPtr.Zero) return 0;
             
         IntPtr rootReturn = IntPtr.Zero, childReturn = IntPtr.Zero;
         int winX = 0, winY = 0;
@@ -963,11 +1069,18 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
             ShowError("No mouse found.");
         }
 
+        return ((mask & 0x100) != 0 ? 1 : 0) | ((mask & 0x400) != 0 ? 2 : 0) |
+            ((mask & 0x200) != 0 ? 4 : 0);
+    }
+
+    public bool GetMouseButton(KeyCode button)
+    {
+        int buttons = GetMouseButtons();
         return button switch
         {
-            KeyCode.Mouse0 => (mask & 0x100) != 0,  // Button1Mask = 1 << 8  (= 0x100)
-            KeyCode.Mouse1 => (mask & 0x400) != 0,  // Button3Mask = 1 << 10 (= 0x400) -> right
-            KeyCode.Mouse2 => (mask & 0x200) != 0,  // Button2Mask = 1 << 9  (= 0x200) -> middle
+            KeyCode.Mouse0 => (buttons & 1) != 0,
+            KeyCode.Mouse1 => (buttons & 2) != 0,
+            KeyCode.Mouse2 => (buttons & 4) != 0,
             _ => false
         };
     }
@@ -1757,8 +1870,30 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
      
     private void UpdateInputMask(int width, int height)
     {
-        if (_isDragging || !_running || _closing)
+        if (!_running || _closing) return;
+        if (_passiveInput)
+        {
+            var source = _companionInputRegions;
+            if (!ReferenceEquals(source, _convertedRegionSource) || _regionWidth != width || _regionHeight != height)
+            {
+                _convertedRegions = new XRectangle[source.Length];
+                for (int i = 0; i < source.Length; i++)
+                {
+                    var rect = source[i];
+                    int x = Mathf.Clamp(Mathf.FloorToInt(rect.xMin), 0, width);
+                    int y = Mathf.Clamp(Mathf.FloorToInt(rect.yMin), 0, height);
+                    _convertedRegions[i] = new XRectangle { x = (short)x, y = (short)y,
+                        width = (ushort)Mathf.Max(0, Mathf.Min(width, Mathf.CeilToInt(rect.xMax)) - x),
+                        height = (ushort)Mathf.Max(0, Mathf.Min(height, Mathf.CeilToInt(rect.yMax)) - y) };
+                }
+                _convertedRegionSource = source; _regionWidth = width; _regionHeight = height;
+            }
+            XShapeCombineRectangles(_display, _unityWindow, ShapeInput, 0, 0,
+                _convertedRegions, _convertedRegions.Length, ShapeSet, Unsorted);
+            XFlush(_display);
             return;
+        }
+        if (_isDragging) return;
 
         // Throttle logic...
         _shapingStopwatch ??= new();
@@ -1842,6 +1977,9 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
         }
 
         imageBytes = GetImageData(xImagePtr, width, height).Data;
+        // Hyprland focuses Xwayland's rectangular window before X11 ShapeInput.
+        // Publish the same immutable alpha pixels for its focus eligibility gate.
+        CompanionManager?.SetInputMask(imageBytes, width, height);
 
         if (!_useShm && xImagePtr != IntPtr.Zero)
         {
@@ -1957,6 +2095,13 @@ public class WindowManager : MonoBehaviour, IPointerDownHandler, IPointerUpHandl
 
                 switch (ev.type)
                 {
+                    case ClientMessage:
+                    {
+                        if (!_closing && _running &&
+                            XGetWindowAttributes(_display, _unityWindow, out var attributes) != 0)
+                            UpdateInputMask(attributes.width, attributes.height);
+                        break;
+                    }
                     case ConfigureNotify:
                     {
                         var ce = ev.configureEvent;

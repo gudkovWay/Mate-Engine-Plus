@@ -52,6 +52,21 @@ namespace MateEngine.Shoji
         static bool _originalAnchorPending, _originalDepthPending;
         static float _nextOriginalDepthAudit;
 
+        public static bool TrySetOtherQuadsActive(MonoBehaviour owner, int activeCount)
+        {
+            var handler = owner as AvatarWindowHandler;
+            if (handler == null || SeatOtherQuads == null) return false;
+            var quads = SeatOtherQuads.GetValue(handler) as List<GameObject>;
+            if (quads == null) return false;
+            for (int i = 0; i < quads.Count; i++)
+            {
+                var quad = quads[i];
+                bool active = i < activeCount;
+                if (quad != null && quad.activeSelf != active) quad.SetActive(active);
+            }
+            return true;
+        }
+
         public static bool BeforeSeatingUpdate(MonoBehaviour owner)
         {
             ShojiSnapshot snapshot = Snapshot();

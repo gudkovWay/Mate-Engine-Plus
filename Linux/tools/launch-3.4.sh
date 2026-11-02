@@ -10,4 +10,8 @@ if [[ -z "${SDL_VIDEO_X11_VISUALID:-}" ]]; then
     export SDL_VIDEO_X11_VISUALID="$visual_id"
 fi
 cd "$PLAYER_DIR"
+if [[ -n "${MATEENGINE_VISION_CONFIG:-}" ]]; then
+    exec python3 "$PLAYER_DIR/vision/mascot_vision_launch.py" \
+        --player "$PLAYER_DIR/MateEngineX.x86_64" --config "$MATEENGINE_VISION_CONFIG" -- "$@"
+fi
 exec "$PLAYER_DIR/MateEngineX.x86_64" "$@"

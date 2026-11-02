@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using UnityEngine;
+using APIs.Hyprland;
 
 public class AvatarWindowHandler : MonoBehaviour
 {
@@ -92,8 +93,117 @@ public class AvatarWindowHandler : MonoBehaviour
 	public int totalWindowSitAnimations = 4;
 
 	private static readonly int windowSitIndexParam = Animator.StringToHash("WindowSitIndex");
+	private static readonly int windowSitState = Animator.StringToHash("Base Layer.WindowSit");
 
 	private bool wasSitting;
+	private bool manualSeat;
+	private CompanionFramePose framePose;
+	private bool bottomEdge;
+	public CompanionFramePose FramePose => framePose;
+	public bool BottomEdge => bottomEdge;
+	private string FrameState => framePose == CompanionFramePose.Dangle ? "Base Layer.FrameDangle" :
+		framePose == CompanionFramePose.Watch ? "Base Layer.FrameWatch" : "Base Layer.FrameLie";
+	private int SupportY(RECT rect) => bottomEdge ? rect.Bottom : rect.Top;
+	private int supportPid, supportWorkspace;
+	private float requiredSeatWidth, requiredSeatHeadroom, poseSettleAfter, poseSettleDeadline;
+	private float standTransitionUntil;
+	private bool standClampPending;
+	private readonly Transform[] contactBones = new Transform[4];
+	private readonly Vector3[] contactLocal = new Vector3[4];
+	private readonly float[] contactWeights = new float[4];
+	private readonly List<Vector3> contactVertices = new List<Vector3>();
+	private readonly Dictionary<Mesh, BoneWeight[]> contactWeightCache = new Dictionary<Mesh, BoneWeight[]>();
+	private Mesh contactMesh;
+	private bool hasSkinContact;
+	private bool calibratedSkin;
+	public string SeatContactBasis => !IsSeated ? "" : calibratedSkin ? "weighted-pelvis-torso-skin" : "pelvis-bone";
+	public bool IsSeated => snappedHWND != IntPtr.Zero;
+	public bool IsAnchored => snappedHWND != IntPtr.Zero;
+	private IntPtr commandSeat;
+	private float commandSeatFraction;
+	public bool SeatTransition => _postSettleRecalib || Time.unscaledTime < standTransitionUntil;
+	public int SeatPose => animator == null ? 0 : Mathf.RoundToInt(animator.GetFloat(windowSitIndexParam));
+	public string SeatSupport => snappedHWND == IntPtr.Zero ? "" : "0x" + snappedHWND.ToInt64().ToString("x");
+	public string SeatAnimation
+	{
+		get
+		{
+			if (animator == null || !IsSeated) return "";
+			var clips = animator.GetCurrentAnimatorClipInfo(0);
+			AnimationClip selected = null; float weight = 0;
+			foreach (var clip in clips)
+				if (clip.clip != null && clip.weight > weight) { selected = clip.clip; weight = clip.weight; }
+			return selected == null ? "" : selected.name;
+		}
+	}
+
+
+	public bool TrySitOnWindow(IntPtr support, int pose = 0, CompanionFramePose frame = CompanionFramePose.Stock, bool bottom = false)
+	{
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager == null || manager.CompanionMotion || animator == null || controller == null || controller.isDragging ||
+			IsSitBlocked() || !animator.HasState(0, windowSitState) ||
+			SaveLoadHandler.Instance?.data == null || !SaveLoadHandler.Instance.data.enableWindowSitting) return false;
+		foreach (var portrait in AvatarBigScreenHandler.ActiveHandlers)
+			if (portrait != null && portrait.avatarAnimator == animator && (portrait.IsBigScreenActive || portrait.IsTransitioning)) return false;
+		string state = frame == CompanionFramePose.Stock ? "Base Layer.WindowSit" :
+			frame == CompanionFramePose.Dangle ? "Base Layer.FrameDangle" :
+			frame == CompanionFramePose.Watch ? "Base Layer.FrameWatch" : "Base Layer.FrameLie";
+		if (!animator.HasState(0, Animator.StringToHash(state))) return false;
+		var body = manager.BodyBounds;
+		if (!manager.TryGetSeatSupport(support, body.width, body.height, out var rect, out var pid, out var workspace, bottom)) return false;
+		float x = Mathf.Clamp(rect.x + rect.width * .65f, rect.xMin + body.width * .5f + 12, rect.xMax - body.width * .5f - 12);
+		int edgeY = CompanionFramePolicy.EdgeY(rect, bottom);
+		if (IsOccludedByHigherWindowsAtPoint(support, Mathf.RoundToInt(x), edgeY - 1)) return false;
+		ClearSnapAndHide();
+		framePose = frame; bottomEdge = bottom;
+		lastDesktopPosition = GetUnityWindowPosition();
+		snappedHWND = support; supportPid = pid; supportWorkspace = workspace;
+		requiredSeatWidth = body.width; requiredSeatHeadroom = body.height;
+		snapFraction = (x - rect.xMin) / Mathf.Max(1, rect.width);
+		animator.SetFloat(windowSitIndexParam, Mathf.Clamp(pose, 0, Mathf.Max(0, totalWindowSitAnimations - 1)));
+		animator.SetBool("isWindowSit", true); animator.SetBool("isTaskbarSit", false);
+		// The stock controller only enters WindowSit from Drag; explicit seating also starts from Idle.
+		animator.CrossFadeInFixedTime(Animator.StringToHash(state), .2f, 0);
+		wasSitting = true; animator.Update(0f);
+		BeginSeatCalibration();
+		CalibrateSeatAnchorToDesktopY(edgeY + seatOffsetPx);
+		manager.SetSnapedWindow(support);
+		_snapSmoothingActive = enableSnapSmoothing;
+		PinToTarget(new RECT { Left = rect.xMin, Top = rect.yMin, Right = rect.xMax, Bottom = rect.yMax });
+		return IsSeated;
+	}
+
+	public bool NextSeatPose()
+	{
+		if (!IsSeated || animator == null || totalWindowSitAnimations < 1) return false;
+		if (framePose != CompanionFramePose.Stock)
+		{
+			if (bottomEdge) framePose = framePose == CompanionFramePose.Lie ? CompanionFramePose.Watch : CompanionFramePose.Lie;
+			animator.CrossFadeInFixedTime(Animator.StringToHash(FrameState), .25f, 0);
+			BeginSeatCalibration();
+			return true;
+		}
+		animator.SetFloat(windowSitIndexParam, (SeatPose + 1) % totalWindowSitAnimations);
+		BeginSeatCalibration();
+		return true;
+	}
+
+	public void SetSeatOffset(float pixels)
+	{
+		if (float.IsNaN(pixels) || float.IsInfinity(pixels)) throw new ArgumentOutOfRangeException(nameof(pixels));
+		seatOffsetPx = Mathf.Clamp(pixels, -128, 128);
+		if (IsSeated) BeginSeatCalibration();
+	}
+
+	private void BeginSeatCalibration()
+	{
+		standClampPending = false; standTransitionUntil = 0;
+		_postSettleRecalib = true; _postSettleFrames = 1;
+		poseSettleAfter = Time.unscaledTime + .35f; poseSettleDeadline = Time.unscaledTime + 2f;
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager != null) manager.SeatTransition = true;
+	}
 
 	[Header("Seat Alignment")]
 	[Range(-256f, 256f)]
@@ -191,10 +301,6 @@ public class AvatarWindowHandler : MonoBehaviour
 	private bool wasDragging;
 
 	private IntPtr snappedHWND = IntPtr.Zero;
-	private IntPtr commandSeat = IntPtr.Zero;
-	private float commandSeatFraction;
-
-	public bool IsAnchored => snappedHWND != IntPtr.Zero;
 
 	private IntPtr unityHWND = IntPtr.Zero;
 
@@ -319,6 +425,9 @@ public class AvatarWindowHandler : MonoBehaviour
 		_currentPid = GetCurrentProcessId();
 		animator = GetComponent<Animator>();
 		controller = GetComponent<AvatarAnimatorController>();
+		var tailClearance = GetComponent<MateEngine.CompanionTailClearance>();
+		if (tailClearance == null) tailClearance = gameObject.AddComponent<MateEngine.CompanionTailClearance>();
+		tailClearance.Configure(animator);
 		if (targetCamera == null)
 		{
 			targetCamera = Camera.main;
@@ -352,11 +461,15 @@ public class AvatarWindowHandler : MonoBehaviour
 	private void OnDisable()
 	{
 		ClearSnapAndHide();
+		standTransitionUntil = 0;
+		standClampPending = false;
+		if (WindowManager.Instance?.CompanionManager != null) WindowManager.Instance.CompanionManager.SeatTransition = false;
 	}
 
 	private void OnDestroy()
 	{
 		CleanupOccluderArtifacts();
+		if (contactMesh != null) Destroy(contactMesh);
 	}
 
 	private void BuildBlockSitCache()
@@ -409,6 +522,33 @@ public class AvatarWindowHandler : MonoBehaviour
 		{
 			return;
 		}
+		var nativeManager = WindowManager.Instance?.CompanionManager;
+		bool dragging = nativeManager != null ? nativeManager.IsDragging : controller.isDragging;
+		if (nativeManager != null) nativeManager.SeatTransition = _postSettleRecalib && IsSeated || Time.unscaledTime < standTransitionUntil;
+		if (nativeManager != null && standClampPending && Time.unscaledTime >= standTransitionUntil &&
+			!nativeManager.CompanionMotion && !nativeManager.IsDragging && nativeManager.Monitors != null)
+		{
+			foreach (var output in nativeManager.Monitors)
+				if (!output.disabled && output.dpmsStatus)
+				{
+					nativeManager.SetCompanionPosition(nativeManager.GetWindowPosition());
+					standClampPending = false;
+					break;
+				}
+		}
+		if (nativeManager != null && snappedHWND != IntPtr.Zero)
+		{
+			if (!manualSeat)
+			{
+				requiredSeatWidth = Mathf.Max(requiredSeatWidth, nativeManager.BodyBounds.width);
+				requiredSeatHeadroom = Mathf.Max(requiredSeatHeadroom, nativeManager.BodyBounds.height);
+			}
+			if (nativeManager.CompanionMotion || controller.isDancing || dragging && !wasDragging ||
+				!nativeManager.TryGetSeatSupport(snappedHWND, manualSeat ? 1 : requiredSeatWidth,
+					manualSeat ? 1 : requiredSeatHeadroom, out _, out var pid, out var workspace, bottomEdge) ||
+				pid != supportPid || workspace != supportWorkspace)
+				ClearSnapAndHide();
+		}
 		if (!SaveLoadHandler.Instance.data.enableWindowSitting)
 		{
 			ClearSnapAndHide();
@@ -432,7 +572,7 @@ public class AvatarWindowHandler : MonoBehaviour
 		if (Time.unscaledTime >= _nextEnumTime)
 		{
 			UpdateCachedWindows();
-			if (snappedHWND != IntPtr.Zero)
+			if (snappedHWND != IntPtr.Zero && nativeManager == null)
 			{
 				RebuildActiveOccluders();
 			}
@@ -498,6 +638,18 @@ public class AvatarWindowHandler : MonoBehaviour
 				ClearSnapAndHide();
 			}
 		}
+		if (nativeManager != null)
+		{
+			// A drop, not the in-flight drag animation, commits the chosen ledge and X contact.
+			if (!dragging && wasDragging && snappedHWND == IntPtr.Zero)
+			{
+				_guardZoneActive = false; _recentUnsnap = false;
+				UpdateCachedWindows();
+				TrySnap();
+			}
+			if (!dragging && snappedHWND != IntPtr.Zero) FollowSnapped(false);
+		}
+		else
 		if (controller.isDragging)
 		{
 			if (snappedHWND == IntPtr.Zero)
@@ -531,6 +683,9 @@ public class AvatarWindowHandler : MonoBehaviour
 		}
 		if (snappedHWND != IntPtr.Zero && _postSettleRecalib)
 		{
+			if (nativeManager != null)
+				_postSettleFrames = Time.unscaledTime < poseSettleDeadline &&
+					(Time.unscaledTime < poseSettleAfter || animator.IsInTransition(0)) ? 1 : 0;
 			if (_postSettleFrames > 0)
 			{
 				_postSettleFrames--;
@@ -539,8 +694,8 @@ public class AvatarWindowHandler : MonoBehaviour
 			{
 				if (GetWindowRect(snappedHWND, out var lpRect))
 				{
-					CalibrateSeatAnchorToDesktopY((float)lpRect.Top + seatOffsetPx);
-					if (ComputeSeatDesktop(out var px2, out px))
+					CalibrateSeatAnchorToDesktopY(SupportY(lpRect) + seatOffsetPx);
+					if (nativeManager == null && ComputeSeatDesktop(out var px2, out px))
 					{
 						float num3 = Mathf.Max(1, lpRect.Right - lpRect.Left);
 						snapFraction = Mathf.Clamp01((px2 - (float)lpRect.Left) / num3);
@@ -551,14 +706,15 @@ public class AvatarWindowHandler : MonoBehaviour
 					PinToTarget(lpRect);
 				}
 				_postSettleRecalib = false;
+				if (nativeManager != null) nativeManager.SeatTransition = false;
 			}
 		}
-		wasDragging = controller.isDragging;
+		wasDragging = dragging;
 	}
 
 	private void LateUpdate()
 	{
-		UpdateOccluderQuadsFrameSync();
+		if (WindowManager.Instance?.CompanionManager == null) UpdateOccluderQuadsFrameSync();
 	}
 
 	private bool DraggedPastSnapThreshold()
@@ -723,6 +879,19 @@ public class AvatarWindowHandler : MonoBehaviour
 
 	private void ClearSnapAndHide(bool fromUnsnap = false)
 	{
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager != null && snappedHWND != IntPtr.Zero)
+		{
+			manager.SetSnapedWindow(IntPtr.Zero);
+			standTransitionUntil = isActiveAndEnabled ? Time.unscaledTime + .6f : 0;
+			manager.SeatTransition = Time.unscaledTime < standTransitionUntil;
+			standClampPending = isActiveAndEnabled && !manualSeat;
+			if (standClampPending && !manager.CompanionMotion && !manager.IsDragging)
+				manager.SetCompanionPosition(manager.GetWindowPosition());
+		}
+		hasSkinContact = false; _postSettleRecalib = false;
+		manualSeat = false;
+		framePose = CompanionFramePose.Stock; bottomEdge = false;
 		_havePrevSnapRect = false;
 		_snapSmoothingActive = false;
 		_snapVelX = (_snapVelY = 0f);
@@ -845,6 +1014,7 @@ public class AvatarWindowHandler : MonoBehaviour
 			window == IntPtr.Zero || window == unityHWND || float.IsNaN(fraction) || float.IsInfinity(fraction) ||
 			fraction < 0f || fraction > 1f || !SaveLoadHandler.Instance.data.enableWindowSitting ||
 			controller.isDragging || IsSitBlocked()) return false;
+		if (WindowManager.Instance?.CompanionManager != null) return TrySitOnWindow(window);
 		int poseState = Animator.StringToHash(animator.GetLayerName(0) + ".WindowSit");
 		if (!animator.HasState(0, poseState)) return false;
 		UpdateCachedWindows();
@@ -893,6 +1063,10 @@ public class AvatarWindowHandler : MonoBehaviour
 		}
 		float num4 = ScaledProbeRadiusI();
 		int candidate = -1;
+		bool candidateBottom = false;
+		float candidateX = px2;
+		var dropManager = WindowManager.Instance?.CompanionManager;
+		var grip = dropManager == null ? new Vector2(px2, py2) : (Vector2)dropManager.GetMousePosition();
 		for (int i = 0; i < cachedWindows.Count; i++)
 		{
 			WindowEntry windowEntry = cachedWindows[i];
@@ -903,11 +1077,24 @@ public class AvatarWindowHandler : MonoBehaviour
 			}
 			int left = windowEntry.rect.Left;
 			int right = windowEntry.rect.Right;
-			int top = windowEntry.rect.Top;
-			float distance = Mathf.Abs(py2 - top);
-			if (!(px2 >= (float)left) || !(px2 <= (float)right) || distance > num4 || IsWindowMaximized(windowEntry.hwnd) ||
+			var nativeManager = WindowManager.Instance?.CompanionManager;
+			bool bottom;
+			float contactX = px2;
+			float distance;
+			if (nativeManager != null && !windowEntry.isTaskbar)
+			{
+				if (!CompanionFramePolicy.TryDrop(new RectInt(left, windowEntry.rect.Top,
+					right - left, windowEntry.rect.Bottom - windowEntry.rect.Top), new Vector2(px2, py2), grip,
+					Mathf.Max(24, probeRadiusPx), out bottom, out contactX)) continue;
+				distance = 0;
+			}
+			else { bottom = false; distance = Mathf.Abs(py2 - windowEntry.rect.Top); }
+			int top = bottom ? windowEntry.rect.Bottom : windowEntry.rect.Top;
+			if (nativeManager != null && !nativeManager.TryGetSeatSupport(windowEntry.hwnd,
+				1, 1, out _, out _, out _, bottom)) continue;
+			if (nativeManager == null && (!(px2 >= left) || !(px2 <= right) || distance > num4) || IsWindowMaximized(windowEntry.hwnd) ||
 				IsWindowFullscreen(windowEntry) || IsSameProcessWindow(windowEntry.hwnd) ||
-				IsOccludedByHigherWindowsAtPoint(windowEntry.hwnd, Mathf.RoundToInt(px2), top))
+				IsOccludedByHigherWindowsAtPoint(windowEntry.hwnd, Mathf.RoundToInt(contactX), top))
 			{
 				continue;
 			}
@@ -916,6 +1103,8 @@ public class AvatarWindowHandler : MonoBehaviour
 			if (!IsEffectivelyTransparentWindow(windowEntry.hwnd, classNameBuffer))
 			{
 				candidate = i;
+				candidateBottom = bottom;
+				candidateX = contactX;
 				break;
 			}
 		}
@@ -926,24 +1115,39 @@ public class AvatarWindowHandler : MonoBehaviour
 			WindowEntry windowEntry = cachedWindows[candidate];
 			int left = windowEntry.rect.Left;
 			int right = windowEntry.rect.Right;
-			int top = windowEntry.rect.Top;
+			bottomEdge = candidateBottom;
+			manualSeat = WindowManager.Instance?.CompanionManager != null;
+			framePose = WindowManager.Instance?.CompanionManager == null || windowEntry.isTaskbar ? CompanionFramePose.Stock :
+				bottomEdge ? CompanionFramePose.Lie : CompanionFramePose.Dangle;
+			int top = SupportY(windowEntry.rect);
 			lastDesktopPosition = GetUnityWindowPosition();
 			snappedHWND = windowEntry.hwnd;
+			var nativeManager = WindowManager.Instance?.CompanionManager;
+			if (nativeManager != null)
+			{
+				if (!nativeManager.TryGetSeatSupport(snappedHWND, 1, 1, out _, out supportPid, out supportWorkspace, bottomEdge))
+				{ ClearSnapAndHide(); return; }
+				requiredSeatWidth = requiredSeatHeadroom = 1;
+				nativeManager.SetSnapedWindow(snappedHWND);
+			}
 			_guardZoneActive = false;
 			animator.SetBool("isWindowSit", value: true);
 			animator.SetBool("isTaskbarSit", windowEntry.isTaskbar);
 			if (commandSeat != IntPtr.Zero && !reuseSeat)
 			{
-				// The normal graph enters WindowSit only from Drag; voice seating must enter it explicitly.
 				animator.SetFloat(windowSitIndexParam, UnityEngine.Random.Range(0, Mathf.Max(1, totalWindowSitAnimations)));
 				animator.Play(Animator.StringToHash(animator.GetLayerName(0) + ".WindowSit"), 0, 0f);
 				wasSitting = true;
+			}
+			if (framePose != CompanionFramePose.Stock)
+			{
+				wasSitting = true;
+				animator.CrossFadeInFixedTime(Animator.StringToHash(FrameState), .2f, 0);
 			}
 			animator.Update(0f);
 			float calibrationY = top + seatOffsetPx;
 			if (commandSeat != IntPtr.Zero && !reuseSeat)
 			{
-				// Manual snapping starts with the probe at the ledge; voice may start anywhere.
 				if (!ComputeDesktopFromWorld(GetProbeWorld(), out var probeX, out var probeY))
 				{
 					ClearSnapAndHide();
@@ -953,14 +1157,12 @@ public class AvatarWindowHandler : MonoBehaviour
 			}
 			if (!reuseSeat) CalibrateSeatAnchorToDesktopY(calibrationY);
 			_postSettleFrames = 1;
-			// The WM move is asynchronous; the old two-frame recalibration can run mid-move.
 			_postSettleRecalib = commandSeat == IntPtr.Zero;
-			if (commandSeat != IntPtr.Zero)
-				UnityEngine.Debug.Log(FormattableString.Invariant($"[VoiceSeat] reusedAnchor={reuseSeat} targetTop={top} calibrationY={calibrationY:F3} seatLocalY={seatLocalAtSnap.y:F6} seatNormY={seatNormY:F6} seatOffsetPx={seatOffsetPx:F3} windowSitYOffset={windowSitYOffset:F6} pose={animator.GetFloat(windowSitIndexParam):F3}"));
+			if (nativeManager != null) BeginSeatCalibration();
 			if (ComputeSeatDesktop(out var px3, out var _))
 			{
 				float num5 = Mathf.Max(1, right - left);
-				snapFraction = Mathf.Clamp01((px3 - (float)left) / num5);
+				snapFraction = Mathf.Clamp01(((nativeManager != null ? candidateX : px3) - left) / num5);
 			}
 			if (commandSeat != IntPtr.Zero) snapFraction = commandSeatFraction;
 			_lastSnapTopY = top;
@@ -975,8 +1177,7 @@ public class AvatarWindowHandler : MonoBehaviour
 			_snapSmoothingActive = enableSnapSmoothing;
 			_snapVelX = (_snapVelY = 0f);
 			_havePrevSnapRect = false;
-			RebuildActiveOccluders();
-			UpdateOccluderQuadsFrameSync();
+			if (nativeManager == null) { RebuildActiveOccluders(); UpdateOccluderQuadsFrameSync(); }
 			if (GetWindowRect(windowEntry.hwnd, out var lpRect))
 			{
 				PinToTarget(lpRect);
@@ -1006,6 +1207,7 @@ public class AvatarWindowHandler : MonoBehaviour
 
 	private bool CalibrateSeatAnchorToDesktopY(float targetDesktopY)
 	{
+		if (WindowManager.Instance?.CompanionManager != null) return CalibrateNativeContact();
 		if (targetCamera == null || !GetUnityClientRect(out var r))
 		{
 			return false;
@@ -1165,15 +1367,36 @@ public class AvatarWindowHandler : MonoBehaviour
 		SetTopMost(en: true);
 	}
 
+	private void PinNativeToTarget(HyprlandManager manager, RECT support)
+	{
+		var client = manager.CompanionWindow;
+		if (client == null || targetCamera == null) return;
+		var point = targetCamera.WorldToScreenPoint(GetSeatWorldCurrent());
+		if (point.z <= .01f) return;
+		var contact = new Vector2(point.x * client.sizeVector.x / targetCamera.pixelWidth,
+			(targetCamera.pixelHeight - point.y) * client.sizeVector.y / targetCamera.pixelHeight);
+		float x = support.Left + snapFraction * Mathf.Max(1, support.Right - support.Left);
+		var body = manager.BodyBounds;
+		if (!manualSeat)
+			x = Mathf.Clamp(x, support.Left + 12 + contact.x - body.xMin, support.Right - 12 + contact.x - body.xMax);
+		var target = Vector2Int.RoundToInt(new Vector2(x, SupportY(support) + seatOffsetPx) - contact);
+		if (!manualSeat && !manager.SeatPlacementSafe(snappedHWND, target, body))
+		{ ClearSnapAndHide(); return; }
+		// Absolute local contact avoids integrating stale asynchronous window observations.
+		if (manager.GetWindowPosition() != target) WindowManager.Instance.SetWindowPosition(target);
+	}
+
 	private void PinToTarget(RECT r)
 	{
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager != null) { PinNativeToTarget(manager, r); return; }
 		if (!ComputeSeatDesktop(out var px, out var py))
 		{
 			return;
 		}
 		int left = r.Left;
 		int right = r.Right;
-		int top = r.Top;
+		int top = SupportY(r);
 		float num = (float)left + snapFraction * (float)Mathf.Max(1, right - left);
 		float num2 = (float)top + seatOffsetPx;
 		int num3 = Mathf.RoundToInt(num - px);
@@ -1244,7 +1467,7 @@ public class AvatarWindowHandler : MonoBehaviour
 			}
 			int left = windowEntry.rect.Left;
 			int right = windowEntry.rect.Right;
-			int top = windowEntry.rect.Top;
+			int top = SupportY(windowEntry.rect);
 			bool num = px >= (float)left && px <= (float)right;
 			bool flag = Mathf.Abs(py - (float)top) <= (float)Mathf.Max(unsnapVerticalBand, ScaledProbeRadiusI());
 			if (!num || !flag)
@@ -1313,6 +1536,13 @@ public class AvatarWindowHandler : MonoBehaviour
 
 	private Vector3 GetSeatWorldCurrent()
 	{
+		if (hasSkinContact)
+		{
+			var skinPoint = Vector3.zero;
+			for (int i = 0; i < 4; i++)
+				if (contactBones[i] != null && contactWeights[i] > 0) skinPoint += contactBones[i].TransformPoint(contactLocal[i]) * contactWeights[i];
+			return skinPoint + transform.up * (windowSitYOffset * transform.lossyScale.y);
+		}
 		if (!seatCalibrated)
 		{
 			return GetHipWorld();
@@ -1345,6 +1575,80 @@ public class AvatarWindowHandler : MonoBehaviour
 		}
 		Bounds combinedWorldBounds = GetCombinedWorldBounds();
 		return new Vector3(combinedWorldBounds.center.x, Mathf.Lerp(combinedWorldBounds.min.y, combinedWorldBounds.center.y, 0.2f), combinedWorldBounds.center.z);
+	}
+
+	private bool CalibrateNativeContact()
+	{
+		if (animator == null || !animator.isHuman || targetCamera == null) return false;
+		var hips = animator.GetBoneTransform(HumanBodyBones.Hips);
+		var spine = animator.GetBoneTransform(HumanBodyBones.Spine);
+		var chest = animator.GetBoneTransform(HumanBodyBones.Chest);
+		var upperChest = animator.GetBoneTransform(HumanBodyBones.UpperChest);
+		if (hips == null) return false;
+		if (contactMesh == null) contactMesh = new Mesh();
+		float lowest = float.PositiveInfinity;
+		SkinnedMeshRenderer chosen = null; BoneWeight chosenWeight = default; Vector3 chosenWorld = default;
+		foreach (var renderer in GetComponentsInChildren<SkinnedMeshRenderer>())
+		{
+			var source = renderer.sharedMesh;
+			if (!renderer.enabled || source == null || !source.isReadable) continue;
+			if (!contactWeightCache.TryGetValue(source, out var weights))
+			{ weights = source.boneWeights; contactWeightCache[source] = weights; }
+			if (weights.Length != source.vertexCount) continue;
+			renderer.BakeMesh(contactMesh); contactMesh.GetVertices(contactVertices);
+			if (contactVertices.Count != weights.Length) continue;
+			var bones = renderer.bones;
+			float Contact(int index, float weight) => index >= 0 && index < bones.Length &&
+				(bones[index] == hips || bones[index] == spine || bones[index] == chest || bones[index] == upperChest) ? weight : 0;
+			for (int i = 0; i < contactVertices.Count; i++)
+			{
+				var weight = weights[i];
+				if (Contact(weight.boneIndex0, weight.weight0) + Contact(weight.boneIndex1, weight.weight1) +
+					Contact(weight.boneIndex2, weight.weight2) + Contact(weight.boneIndex3, weight.weight3) < .5f) continue;
+				var world = renderer.transform.TransformPoint(contactVertices[i]);
+				var screen = targetCamera.WorldToScreenPoint(world);
+				if (screen.z <= 0 || float.IsNaN(screen.y) || screen.y >= lowest) continue;
+				lowest = screen.y; chosen = renderer; chosenWeight = weight; chosenWorld = world;
+			}
+		}
+		hasSkinContact = false;
+		if (chosen != null)
+		{
+			var bones = chosen.bones; var bindposes = chosen.sharedMesh.bindposes;
+			int Index(int i) => i == 0 ? chosenWeight.boneIndex0 : i == 1 ? chosenWeight.boneIndex1 : i == 2 ? chosenWeight.boneIndex2 : chosenWeight.boneIndex3;
+			float Weight(int i) => i == 0 ? chosenWeight.weight0 : i == 1 ? chosenWeight.weight1 : i == 2 ? chosenWeight.weight2 : chosenWeight.weight3;
+			var skin = Matrix4x4.zero;
+			bool valid = true;
+			for (int i = 0; i < 4; i++)
+			{
+				int index = Index(i); float weight = Weight(i);
+				if (weight <= 0) continue;
+				if (index < 0 || index >= bones.Length || index >= bindposes.Length || bones[index] == null) { valid = false; break; }
+				var matrix = bones[index].localToWorldMatrix * bindposes[index];
+				for (int element = 0; element < 16; element++) skin[element] += matrix[element] * weight;
+			}
+			if (valid && !float.IsNaN(skin.determinant) && Mathf.Abs(skin.determinant) > 1e-12f)
+			{
+				var vertex = skin.inverse.MultiplyPoint3x4(chosenWorld);
+				for (int i = 0; i < 4; i++)
+				{
+					int index = Index(i); contactWeights[i] = Weight(i);
+					contactBones[i] = contactWeights[i] > 0 ? bones[index] : null;
+					contactLocal[i] = contactWeights[i] > 0 ? bindposes[index].MultiplyPoint3x4(vertex) : Vector3.zero;
+				}
+				hasSkinContact = true;
+			}
+		}
+		calibratedSkin = hasSkinContact;
+		if (!hasSkinContact)
+		{
+			// Unreadable meshes retain a real pelvis anchor; offset calibration remains explicit.
+			contactBones[0] = hips; contactLocal[0] = Vector3.zero; contactWeights[0] = 1;
+			for (int i = 1; i < 4; i++) { contactBones[i] = null; contactWeights[i] = 0; }
+			hasSkinContact = true;
+		}
+		seatCalibrated = true;
+		return true;
 	}
 
 	private Bounds GetCombinedWorldBounds()
@@ -1555,7 +1859,7 @@ public class AvatarWindowHandler : MonoBehaviour
 		for (int i = 0; i < otherQuadGOs.Count; i++)
 		{
 			bool flag = i < activeCount;
-			if (otherQuadGOs[i].activeSelf != flag)
+			if (otherQuadGOs[i] != null && otherQuadGOs[i].activeSelf != flag)
 			{
 				otherQuadGOs[i].SetActive(flag);
 			}
@@ -1701,8 +2005,14 @@ public class AvatarWindowHandler : MonoBehaviour
 		return true;
 	}
 
+	private bool? appliedNativeTopmost;
 	private void SetTopMost(bool en)
 	{
+		if (WindowManager.Instance?.CompanionManager != null)
+		{
+			if (appliedNativeTopmost == en) return;
+			appliedNativeTopmost = en;
+		}
 		SetWindowPos(unityHWND, en ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, 19u);
 	}
 
