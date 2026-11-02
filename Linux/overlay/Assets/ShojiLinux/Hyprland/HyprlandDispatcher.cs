@@ -17,15 +17,11 @@ namespace APIs.Hyprland
     /// </summary>
     public class HyprlandDispatcher : HyprlandSocketBase, IDisposable
     {
-        class DispatchItem
+        sealed class DispatchItem
         {
-            internal SemaphoreSlim Semaphore { get; set; }
-            internal string Response { get; set; }
-            internal string Command { get; set; }
-            public DispatchItem()
-            {
-                Semaphore = new SemaphoreSlim(0);
-            }
+            internal readonly TaskCompletionSource<string> Completion =
+                new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            internal string Command;
         }
 
         const string _SocketName = ".socket.sock";
@@ -33,6 +29,7 @@ namespace APIs.Hyprland
         ConcurrentQueue<DispatchItem> _DispatchItems;
         SemaphoreSlim _QueueSemaphore = new SemaphoreSlim(0);
         UnixDomainSocketEndPoint _EndPoint;
+        Task _Worker;
 
         HyprlandCommandGenerator _CommandGenerator;
 
@@ -49,9 +46,15 @@ namespace APIs.Hyprland
                 RedirectStandardOutput = true,
                 UseShellExecute = false
             };
-            var p = Process.Start(psi);
-            var output = p.StandardOutput.ReadToEnd();
-            return output.Contains("configProvider: lua");
+            using var p = Process.Start(psi);
+            var output = p.StandardOutput.ReadToEndAsync();
+            if (!p.WaitForExit(2000))
+            {
+                p.Kill();
+                throw new TimeoutException("Hyprland configuration query expired");
+            }
+            if (p.ExitCode != 0) throw new IOException("Hyprland configuration query failed");
+            return output.GetAwaiter().GetResult().Contains("configProvider: lua");
         }
 
         public void Initialize()
@@ -68,44 +71,54 @@ namespace APIs.Hyprland
             else
                 _CommandGenerator = new HyprLangCommandGenerator();
 
-            Task.Run(async () =>
+            _Worker = Task.Run(async () =>
             {
-                while (!_CancellationTokenSource.IsCancellationRequested)
+                var buffer = new byte[8192];
+                try
                 {
-                    // wait here until the semaphore has been released/ an item has been queued
-                    await _QueueSemaphore.WaitAsync(_CancellationTokenSource.Token);
-                    if (_DispatchItems.TryDequeue(out DispatchItem item))
+                    while (!_CancellationTokenSource.IsCancellationRequested)
                     {
-                        var sendData = Encoding.UTF8.GetBytes(item.Command);
-                        using var ms = new MemoryStream();
-                        // connect to socket dispacher an close as quickly as possible,
-                        // hyprland sync dispatches and socket connections 
-                        // hanging here will freeze the windowmanager
-                        using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                        await _QueueSemaphore.WaitAsync(_CancellationTokenSource.Token);
+                        if (!_DispatchItems.TryDequeue(out DispatchItem item) || item.Completion.Task.IsCompleted)
+                            continue;
+                        try
                         {
-                            // write the command 
+                            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_CancellationTokenSource.Token);
+                            deadline.CancelAfter(2000);
+                            using var registration = deadline.Token.Register(() => socket.Dispose());
                             await socket.ConnectAsync(_EndPoint);
-                            var ok = await socket.SendAsync(sendData, SocketFlags.None);
-                            if (ok < sendData.Length)
-                                throw new Exception("send data too small");
-
-                            // read the response
-                            var buffer = new byte[4096];
-                            var received = await socket.ReceiveAsync(buffer, SocketFlags.None);
-                            await ms.WriteAsync(buffer, 0, received);
-                            while (received > 0)
+                            var data = Encoding.UTF8.GetBytes(item.Command);
+                            int sent = 0;
+                            while (sent < data.Length)
                             {
-                                received = await socket.ReceiveAsync(buffer, SocketFlags.None);
-                                await ms.WriteAsync(buffer, 0, received);
+                                int count = await socket.SendAsync(new ArraySegment<byte>(data, sent, data.Length - sent), SocketFlags.None);
+                                if (count == 0) throw new EndOfStreamException("Hyprland socket closed during send");
+                                sent += count;
                             }
+                            using var response = new MemoryStream();
+                            int received;
+                            while ((received = await socket.ReceiveAsync(buffer, SocketFlags.None)) > 0)
+                            {
+                                if (response.Length + received > 1024 * 1024)
+                                    throw new IOException("Hyprland response exceeds limit");
+                                response.Write(buffer, 0, received);
+                            }
+                            item.Completion.TrySetResult(Encoding.UTF8.GetString(response.GetBuffer(), 0, (int)response.Length));
                         }
-                        ms.Position = 0;
-                        using var streamReader = new StreamReader(ms);
-                        item.Response = await streamReader.ReadToEndAsync();
-                        item.Semaphore.Release();
+                        catch (Exception error)
+                        {
+                            item.Completion.TrySetException(error);
+                        }
                     }
                 }
-            }, _CancellationTokenSource.Token);
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    while (_DispatchItems.TryDequeue(out DispatchItem item))
+                        item.Completion.TrySetCanceled();
+                }
+            });
         }
 
         public bool SocketExists() => SockerExistsImpl(_SocketName);
@@ -140,6 +153,33 @@ namespace APIs.Hyprland
             return JsonUtility.FromJson<HyprlandWorkspace>(response);
         }
 
+        public async Task<HyprlandClient> GetActiveWindowAsync()
+        {
+            var response = await DispatchCommandAsync("-j/activewindow");
+            return JsonUtility.FromJson<HyprlandClient>(response);
+        }
+
+        public Task FocusWindowIfActiveAsync(string address, int pid, string expectedActive, bool unlockTarget)
+        {
+            if (!_LUAConfigMode) throw new NotSupportedException("Atomic keyboard focus requires Hyprland Lua IPC");
+            if (!ValidAddress(address) || !ValidAddress(expectedActive)) throw new ArgumentException("Invalid focus window address");
+            var unlock = unlockTarget
+                ? "hl.dispatch(hl.dsp.window.set_prop({prop='no_focus',value='false',window=t})); "
+                : "";
+            return DispatchCommandAsync("eval local a=hl.get_active_window(); local t=hl.get_window('address:" + address +
+                "'); if a and a.address=='" + expectedActive + "' and t and t.pid==" + pid +
+                " and t.mapped and not t.hidden and t.visible and t.workspace and not t.workspace.special and t.monitor and t.monitor.dpms_status" +
+                " and (t.pinned or t.workspace.active) then " + unlock + "hl.dispatch(hl.dsp.focus({window=t})); end");
+        }
+
+        static bool ValidAddress(string address)
+        {
+            if (string.IsNullOrEmpty(address) || !address.StartsWith("0x", StringComparison.Ordinal) || address.Length > 18) return false;
+            for (int i = 2; i < address.Length; i++)
+                if (!Uri.IsHexDigit(address[i])) return false;
+            return address.Length > 2;
+        }
+
         public async Task<Vector2Int> GetCursorPositionAsync()
         {
             var response = await DispatchCommandAsync("cursorpos");
@@ -162,29 +202,39 @@ namespace APIs.Hyprland
 
         public async Task TogglePinAsync(string windowAddress) => await DispatchCommandAsync(_CommandGenerator.TogglePinAsync(windowAddress));
 
+        public Task SetZOrderAsync(string windowAddress, bool top) => DispatchCommandAsync(_LUAConfigMode
+            ? $"dispatch hl.dsp.window.alter_zorder({{ mode = \"{(top ? "top" : "bottom")}\", window = \"address:{windowAddress}\" }})"
+            : $"dispatch alterzorder {(top ? "top" : "bottom")},address:{windowAddress}");
+
         public async Task ResizewindowpixelExactWindowSizeAsync(string windowAddress, Vector2Int size)  => await DispatchCommandAsync(_CommandGenerator.ResizewindowpixelExactWindowSize(windowAddress,size));
 
         public async Task MoveWindowPixelExactAsync(string windowAddress, Vector2Int pos) => await DispatchCommandAsync(_CommandGenerator.MoveWindowPixelExact(windowAddress,pos));
 
         async Task<string> DispatchCommandAsync(string command)
         {
-            var item = new DispatchItem
-            {
-                Command = command
-            };
+            _CancellationTokenSource.Token.ThrowIfCancellationRequested();
+            if (_DispatchItems.Count >= 32)
+                throw new IOException("Hyprland command queue is full");
+            var item = new DispatchItem { Command = command };
             _DispatchItems.Enqueue(item);
             _QueueSemaphore.Release();
-            // wait here until the dispatch item has been processed
-            await item.Semaphore.WaitAsync();
-            item.Semaphore.Dispose();
-            return item.Response;
+            if (await Task.WhenAny(item.Completion.Task, Task.Delay(5000, _CancellationTokenSource.Token)) != item.Completion.Task)
+                item.Completion.TrySetException(new TimeoutException("Hyprland command expired"));
+            var response = await item.Completion.Task;
+            if ((command.StartsWith("dispatch ", StringComparison.Ordinal) || command.StartsWith("eval ", StringComparison.Ordinal)) && response.Trim() != "ok")
+                throw new IOException("Hyprland rejected command: " + response);
+            return response;
         }
 
         public void Dispose()
         {
             _CancellationTokenSource?.Cancel();
-            _DispatchItems?.Clear();
-            _QueueSemaphore?.Release();
+            try
+            {
+                if (_Worker != null && !_Worker.Wait(1500))
+                    Console.Error.WriteLine("Hyprland dispatcher did not stop before shutdown deadline");
+            }
+            catch (AggregateException error) { Console.Error.WriteLine(error.GetBaseException().Message); }
         }
     }
 

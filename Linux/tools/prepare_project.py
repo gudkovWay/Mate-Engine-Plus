@@ -7,6 +7,7 @@ The input export and original player remain untouched. Import/build is separate.
 from pathlib import Path
 import re
 import shutil
+from prepare_companion_assets import generate
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPORT = ROOT / 'recovered/ExportedProject'
@@ -59,4 +60,5 @@ if match is None or 'guid: cc0f1142f58ed206dacd496ae6179c11' not in match[0]:
 text = pattern.sub('', text, count=1)
 text = re.sub(r'^  - component: \{fileID: 4900\}\n', '', text, flags=re.M)
 scene.write_text(text)
+generate(PROJECT)
 print('Separate Linux project prepared. Supply dependencies and restore data before importing/building.')

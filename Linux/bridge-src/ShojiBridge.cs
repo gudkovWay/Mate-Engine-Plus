@@ -15,8 +15,8 @@ namespace MateEngine.Shoji
     // Under ShojiWM the X11 view of MateEngine (xwayland-satellite) has no
     // real window position, no pointer outside its own surfaces and drops
     // move requests; these hooks answer from the compositor instead.
-    // Outside a ShojiWM session, or with MATEENGINE_SHOJI_BRIDGE=0, every hook
-    // reports "not handled" and the original code runs unchanged.
+    // Geometry hooks outside ShojiWM fall through to the original backend.
+    // The desktop pult is separately enabled by MATEENGINE_CONTROL_SOCKET.
     public static partial class ShojiBridge
     {
         static bool _initialized;
@@ -270,6 +270,14 @@ namespace MateEngine.Shoji
 
         public static Vector3 GetUnityMousePosition()
         {
+            var native = WindowManager.Instance?.CompanionManager;
+            var client = native?.CompanionWindow;
+            if (client != null && client.sizeVector.x > 0 && client.sizeVector.y > 0)
+            {
+                var pointer = native.GetMousePosition();
+                return new Vector3((pointer.x - client.atVector.x) * (float)Screen.width / client.sizeVector.x,
+                    Screen.height - (pointer.y - client.atVector.y) * (float)Screen.height / client.sizeVector.y, 0);
+            }
             ShojiSnapshot snapshot = Snapshot();
             if (snapshot != null && !snapshot.WindowVisible) return new Vector3(-100000, -100000, 0);
             if (snapshot == null || !snapshot.HasWindow || !snapshot.HasPointer) return Input.mousePosition;
@@ -281,7 +289,8 @@ namespace MateEngine.Shoji
         public static Vector3 ScreenToWorldPointer(Camera camera, Vector3 original)
         {
             ShojiSnapshot snapshot = Snapshot();
-            if (snapshot != null && (!snapshot.WindowVisible || (snapshot.HasWindow && snapshot.HasPointer)))
+            if (WindowManager.Instance?.CompanionManager?.CompanionWindow != null ||
+                snapshot != null && (!snapshot.WindowVisible || snapshot.HasWindow && snapshot.HasPointer))
             {
                 Vector3 pointer = GetUnityMousePosition();
                 original.x = pointer.x;
@@ -368,6 +377,7 @@ namespace MateEngine.Shoji
 
         public static void SetClientDragging(bool dragging)
         {
+            MateEngine.Desktop.DesktopPanel.PointerDragChanged(dragging);
             ShojiSnapshot snapshot = Snapshot();
             if (snapshot != null && snapshot.HasSurfaces) _ipc.SetDragging(dragging);
         }
@@ -378,8 +388,13 @@ namespace MateEngine.Shoji
         // Assembly-CSharp never reference Assembly-CSharp itself.)
         public static bool Tick(MonoBehaviour owner, bool dragging)
         {
-            if (!Active) return false;
+            MateEngine.Desktop.DesktopPanel.EnsureCreated();
             var windowManager = owner as WindowManager;
+            // The X11 alpha mask also includes the shadow on native Hyprland.
+            // Its filtering must not depend on the ShojiWM geometry bridge.
+            try { UpdateShadow(windowManager); }
+            catch (Exception e) { _shadow = null; Report(e); }
+            if (!Active) return false;
             bool release = false;
             try { UpdateVoiceControl(windowManager); }
             catch (Exception e) { Report(e); }
@@ -396,15 +411,6 @@ namespace MateEngine.Shoji
             catch (Exception e) { Report(e); }
             try { UpdateMedia(); }
             catch (Exception e) { Report(e); }
-            try
-            {
-                UpdateShadow(windowManager);
-            }
-            catch (Exception e)
-            {
-                _shadow = null;
-                Report(e);
-            }
             return release;
         }
 
@@ -463,6 +469,11 @@ namespace MateEngine.Shoji
 
             return dragging && (!held || _releaseForced || lostFocus);
         }
+        public static bool CompanionMotionOwns(Animator animator)
+        {
+            return MateEngine.Desktop.CompanionLocomotion.Owns(animator);
+        }
+
 
         // Replaces Input.GetMouseButtonUp in AvatarAnimatorController.Update.
         // There it only clears mouseHeld, so answering "the button is up now"
@@ -1506,7 +1517,6 @@ namespace MateEngine.Shoji
         // the window pixmap just before GenerateRectangles; no Unity API here.
         public static void FilterInputPixels(byte[] pixels, int width, int height)
         {
-            if (!_active) return;
             ShadowSpec spec = _shadow;
             Coverage coverage = _coverage;
             if (spec == null || coverage == null || pixels == null) return;

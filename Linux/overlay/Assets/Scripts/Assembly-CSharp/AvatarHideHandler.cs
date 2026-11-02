@@ -184,6 +184,13 @@ public class AvatarHideHandler : MonoBehaviour
 		{
 			return;
 		}
+		// Native placement has one compositor-owned position writer.
+		if (WindowManager.Instance?.CompanionManager != null)
+		{
+			if (snappedSide != Side.None) Unsnap();
+			wasDragging = controller.isDragging;
+			return;
+		}
 		if (controller.isDragging && !wasDragging && GetWindowRect(unityHWND, out var lpRect) && GetCursorPos(out var lpPoint))
 		{
 			dragBaseW = Math.Max(1, lpRect.Right - lpRect.Left);

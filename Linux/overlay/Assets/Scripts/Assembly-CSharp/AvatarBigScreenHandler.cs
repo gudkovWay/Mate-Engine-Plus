@@ -55,6 +55,63 @@ public class AvatarBigScreenHandler : MonoBehaviour
 
 	public bool IsBigScreenActive => isBigScreenActive;
 
+	public bool IsAutomaticActive => automaticOwner;
+	public bool IsTransitioning => manualPending || isFading || isInDesktopTransition;
+	public string AutomaticMonitor => automaticMonitor;
+	private bool automaticOwner, automaticExiting;
+	private bool portraitLeaseOwned, manualPending;
+	private bool automaticManualPlacement;
+	private string automaticMonitor, restoreMonitor;
+	private RectInt automaticArea, restoreArea;
+	private Rect restoreBody;
+	private Vector2Int restorePosition;
+	private Vector2Int automaticWindowSize;
+	private float automaticUntil;
+
+	public bool TryBeginAutomatic(string monitorName)
+	{
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager == null || manager.CompanionWindow == null || manager.Monitors == null ||
+			isBigScreenActive || IsTransitioning || avatarAnimator == null || MainCamera == null) return false;
+		var target = Array.Find(manager.Monitors, item => item.name == monitorName && !item.disabled && item.dpmsStatus);
+		var original = Array.Find(manager.Monitors, item => item.id == manager.CompanionWindow.monitor && !item.disabled);
+		bool ownedAudition = manager.OwnedAuditionPresentable && target != null && target.id == manager.CompanionWindow.monitor;
+		if (target == null || original == null || manager.BodyBounds.width <= 0 || manager.BodyBounds.height <= 0 ||
+			(!manager.CompanionWindow.pinned && !ownedAudition && target.activeWorkspace?.id != manager.CompanionWindow.workspace?.id)) return false;
+		if (!manager.TryOwnMotion(this)) return false;
+		portraitLeaseOwned = true;
+		automaticManualPlacement = false;
+		automaticOwner = true; automaticExiting = false;
+		automaticMonitor = target.name; automaticArea = target.workArea;
+		restoreMonitor = original.name; restoreArea = original.workArea;
+		restorePosition = manager.GetWindowPosition(); restoreBody = manager.BodyBounds;
+		automaticWindowSize = manager.CompanionWindow.sizeVector;
+		automaticUntil = Time.unscaledTime + 8f;
+		manager.CompanionAnimationActive = true;
+		ActivateBigScreen();
+		return isBigScreenActive;
+	}
+
+	public void CancelAutomatic()
+	{
+		if (!automaticOwner) return;
+		automaticManualPlacement |= WindowManager.Instance?.CompanionManager?.IsDragging == true;
+		if (automaticExiting) return;
+		automaticExiting = true;
+		DeactivateBigScreen();
+	}
+
+	private void RestorePortraitPosition()
+	{
+		if (automaticManualPlacement) return;
+		var manager = WindowManager.Instance?.CompanionManager;
+		if (manager == null || manager.Monitors == null) return;
+		var target = Array.Find(manager.Monitors, item => item.name == restoreMonitor && !item.disabled && item.dpmsStatus);
+		if (target == null) target = Array.Find(manager.Monitors, item => !item.disabled && item.dpmsStatus);
+		if (target == null) return;
+		manager.SetPortraitPosition(this, APIs.Hyprland.CompanionPresencePolicy.RestorePosition(restorePosition, restoreArea, target.workArea, restoreBody));
+	}
+
 	private Vector3 originalCamPos;
 
 	private Quaternion originalCamRot;
@@ -122,10 +179,40 @@ public class AvatarBigScreenHandler : MonoBehaviour
 	private void OnDisable()
 	{
 		ActiveHandlers.Remove(this);
+		if (manualPending)
+		{
+			if (fadeCoroutine != null) StopCoroutine(fadeCoroutine);
+			manualPending = false;
+		}
+		if (portraitLeaseOwned)
+		{
+			if (fadeCoroutine != null) StopCoroutine(fadeCoroutine);
+			RestorePortraitPosition();
+			if (MainCamera != null)
+			{
+				MainCamera.transform.SetPositionAndRotation(originalCamPos, originalCamRot);
+				MainCamera.fieldOfView = originalFOV; MainCamera.orthographicSize = originalOrthoSize;
+			}
+			if (avatarAnimator != null) avatarAnimator.SetBool("isBigScreen", false);
+			if (avatarAnimatorController != null) avatarAnimatorController.BlockDraggingOverride = false;
+			if (moveCanvas != null && moveCanvasWasActive) moveCanvas.SetActive(true);
+			if (WindowManager.Instance?.CompanionManager != null)
+			{
+				WindowManager.Instance.CompanionManager.ReleaseMotion(this);
+			}
+			portraitLeaseOwned = automaticOwner = automaticExiting = isBigScreenActive = isFading = isInDesktopTransition = false;
+		}
 	}
 
 	public void ToggleBigScreenFromUI()
 	{
+		if (manualPending)
+		{
+			if (fadeCoroutine != null) StopCoroutine(fadeCoroutine);
+			fadeCoroutine = null; manualPending = false;
+			return;
+		}
+		if (automaticOwner) { CancelAutomatic(); return; }
 		if (isFading || isInDesktopTransition) return;
 		if (!isBigScreenActive)
 		{
@@ -140,7 +227,7 @@ public class AvatarBigScreenHandler : MonoBehaviour
 	public bool SetPortraitFromBridge(bool enabled)
 	{
 		if (isBigScreenActive == enabled) return true;
-		if (isFading || isInDesktopTransition) return false;
+		if (IsTransitioning) return false;
 		ToggleBigScreenFromUI();
 		return true;
 	}
@@ -178,6 +265,18 @@ public class AvatarBigScreenHandler : MonoBehaviour
 
 	private void Update()
 	{
+		if (portraitLeaseOwned && WindowManager.Instance?.CompanionManager?.IsDragging == true)
+			automaticManualPlacement = true;
+		if (automaticOwner && !automaticExiting)
+		{
+			var manager = WindowManager.Instance?.CompanionManager;
+			var target = manager?.Monitors == null ? null : Array.Find(manager.Monitors, item => item.name == automaticMonitor);
+			if (Time.unscaledTime >= automaticUntil || target == null || target.disabled || !target.dpmsStatus ||
+				target.workArea != automaticArea || manager.IsDragging || (!manager.SurfacePresentable && !manager.OwnedAuditionPresentable) ||
+				manager.CompanionWindow == null || manager.CompanionWindow.sizeVector != automaticWindowSize ||
+				avatarAnimator == null || !avatarAnimator.isActiveAndEnabled)
+				CancelAutomatic();
+		}
 		foreach (KeyCode toggleKey in ToggleKeys)
 		{
 			if (Input.GetKeyDown(toggleKey))
@@ -210,9 +309,12 @@ public class AvatarBigScreenHandler : MonoBehaviour
 		float scale = avatarAnimator.transform.lossyScale.y;
 		Vector3 head = bone.position;
 		position = new Vector3(head.x, head.y + YOffset * scale, originalCamPos.z);
+		float viewportScale = automaticOwner ? APIs.Hyprland.CompanionPresencePolicy.PortraitViewportScale(automaticWindowSize, automaticArea) : 1f;
 		if (TargetZoom > 0f)
 		{
 			zoom = MainCamera.orthographic ? TargetZoom * Mathf.Abs(scale) : TargetZoom;
+			if (automaticOwner) zoom = MainCamera.orthographic ? zoom * viewportScale :
+				Mathf.Clamp(2f * Mathf.Atan(Mathf.Tan(zoom * Mathf.Deg2Rad * .5f) * viewportScale) * Mathf.Rad2Deg, 1f, 179f);
 			return;
 		}
 		Transform neck = avatarAnimator.GetBoneTransform(HumanBodyBones.Neck);
@@ -225,6 +327,7 @@ public class AvatarBigScreenHandler : MonoBehaviour
 			extent = Mathf.Tan(fov * Mathf.Deg2Rad * 0.5f);
 		}
 		extent = FitPortraitHands(headHeight, position, extent);
+		extent *= viewportScale;
 		zoom = MainCamera.orthographic ? extent : Mathf.Clamp(2f * Mathf.Atan(extent) * Mathf.Rad2Deg, 1f, 179f);
 	}
 
@@ -273,8 +376,39 @@ public class AvatarBigScreenHandler : MonoBehaviour
 
 	private void ActivateBigScreen()
 	{
-		if (!isBigScreenActive && !isFading && !isInDesktopTransition)
+		if (isBigScreenActive || IsTransitioning) return;
+		if (!automaticOwner && WindowManager.Instance?.CompanionManager != null)
 		{
+			manualPending = true;
+			fadeCoroutine = StartCoroutine(BeginManualPortrait());
+			return;
+		}
+		EnterBigScreen();
+	}
+
+	private IEnumerator BeginManualPortrait()
+	{
+		// The bridge releases its attention controller in LateUpdate before stock parameters are changed.
+		yield return null;
+		var manager = WindowManager.Instance?.CompanionManager;
+		var seating = GetComponent<AvatarWindowHandler>();
+		if (seating != null) seating.ForceExitWindowSitting();
+		if (manager != null) manager.SampleInteraction();
+		var original = manager?.Monitors == null || manager.CompanionWindow == null ? null :
+			Array.Find(manager.Monitors, item => item.id == manager.CompanionWindow.monitor && !item.disabled && item.dpmsStatus);
+		manualPending = false;
+		fadeCoroutine = null;
+		if (original == null || avatarAnimator == null || MainCamera == null ||
+			manager.BodyBounds.width <= 0 || manager.BodyBounds.height <= 0 || !manager.TryOwnMotion(this)) yield break;
+		portraitLeaseOwned = true;
+		automaticManualPlacement = false;
+		restoreMonitor = original.name; restoreArea = original.workArea;
+		restorePosition = manager.GetWindowPosition(); restoreBody = manager.BodyBounds;
+		EnterBigScreen();
+	}
+
+	private void EnterBigScreen()
+	{
 			SaveCameraState();
 			if (unityHWND != IntPtr.Zero && GetWindowRect(unityHWND, out var rect))
 			{
@@ -310,7 +444,6 @@ public class AvatarBigScreenHandler : MonoBehaviour
 			isFading = true;
 			isInDesktopTransition = true;
 			fadeCoroutine = StartCoroutine(BigScreenEnterSequence());
-		}
 	}
 
 	private void DeactivateBigScreen()
@@ -368,7 +501,8 @@ public class AvatarBigScreenHandler : MonoBehaviour
 			{
 				moveCanvas.SetActive(value: true);
 			}
-			if (unityHWND != IntPtr.Zero && originalRectSet)
+			if (portraitLeaseOwned) RestorePortraitPosition();
+			else if (unityHWND != IntPtr.Zero && originalRectSet)
 			{
 				int nWidth = originalWindowRect.right - originalWindowRect.left;
 				int nHeight = originalWindowRect.bottom - originalWindowRect.top;
@@ -456,10 +590,24 @@ public class AvatarBigScreenHandler : MonoBehaviour
 			MainCamera.orthographic ? originalOrthoSize : originalFOV, duration);
 		if (toFadeY && unityHWND != IntPtr.Zero && GetWindowRect(unityHWND, out var lpRect))
 		{
-			RECT rECT = FindBestMonitorRect(lpRect);
-			int nWidth = rECT.right - rECT.left;
-			int nHeight = rECT.bottom - rECT.top;
-			MoveWindow(unityHWND, rECT.left, rECT.top, nWidth, nHeight, bRepaint: true);
+			var manager = WindowManager.Instance?.CompanionManager;
+			if (automaticOwner && manager != null)
+			{
+				var target = Array.Find(manager.Monitors, item => item.name == automaticMonitor && !item.disabled && item.dpmsStatus);
+				if (target == null || target.workArea != automaticArea) { CancelAutomatic(); yield break; }
+				var size = manager.CompanionWindow.sizeVector;
+				manager.SetPortraitPosition(this, new Vector2Int(target.workArea.x + (target.workArea.width - size.x) / 2,
+					target.workArea.y + (target.workArea.height - size.y) / 2));
+			}
+			else
+			{
+				RECT rECT = FindBestMonitorRect(lpRect);
+				int nWidth = rECT.right - rECT.left;
+				int nHeight = rECT.bottom - rECT.top;
+				if (portraitLeaseOwned && manager != null)
+					manager.SetPortraitPosition(this, new Vector2Int(rECT.left, rECT.top));
+				else MoveWindow(unityHWND, rECT.left, rECT.top, nWidth, nHeight, bRepaint: true);
+			}
 		}
 		if (!toFadeY && MainCamera != null)
 		{
@@ -485,5 +633,12 @@ public class AvatarBigScreenHandler : MonoBehaviour
 		yield return GlideAvatarDesktop(0.4f, toFadeY: false);
 		isFading = false;
 		fadeCoroutine = null;
+		if (portraitLeaseOwned)
+		{
+			portraitLeaseOwned = automaticOwner = automaticExiting = false;
+			automaticMonitor = null;
+			var manager = WindowManager.Instance?.CompanionManager;
+			if (manager != null) manager.ReleaseMotion(this);
+		}
 	}
 }
