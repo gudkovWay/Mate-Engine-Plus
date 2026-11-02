@@ -10,7 +10,7 @@ def git(*args):
 paths = git('diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z').decode().split('\0')
 allowed_roots = {'README.md', 'README.ru.md', 'README.zh-CN.md', '.gitignore', 'CHANGELOG.md'}
 allowed_suffixes = {'.cs', '.meta', '.shader', '.compute', '.cginc', '.hlsl', '.asmdef',
-                    '.asmref', '.py', '.sh', '.md', '.txt', '.json', '.svg'}
+                    '.asmref', '.py', '.sh', '.md', '.txt', '.json', '.svg', '.c', '.mjs'}
 private_dirs = {'project', 'steam-source', 'recovered', 'inspection', 'builds',
                 'user-profile', 'baseline', 'UserSettings', 'DLC', 'AudioClip',
                 'Texture2D', 'Mesh', 'AnimationClip', 'RebuiltAvatars', 'RebuiltFonts'}
@@ -26,7 +26,8 @@ for name in filter(None, paths):
     if name not in allowed_roots and not name.startswith(('Linux/', 'docs/', 'Minecraft/MateSignalPlus/')):
         findings.append((name, 'outside publication allowlist'))
     java_source = name.startswith('Minecraft/MateSignalPlus/src/') and path.suffix == '.java'
-    if path.suffix not in allowed_suffixes and name != '.gitignore' and not java_source:
+    protocol_source = name.startswith('Linux/tools/protocols/') and path.suffix == '.xml'
+    if path.suffix not in allowed_suffixes and name != '.gitignore' and not java_source and not protocol_source:
         findings.append((name, 'resource/binary extension'))
     if set(path.parts) & private_dirs or any('dlc' in part.lower() for part in path.parts):
         findings.append((name, 'private/resource directory'))
